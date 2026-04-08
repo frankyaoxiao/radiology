@@ -1,0 +1,39 @@
+# Tiny smoke config — single-node, 2 GPUs, 16 train / 16 val samples,
+# 8 total steps with eval at step 4 and 8. Used to validate the DDP path
+# (all_gather in eval, ckpt save, etc.) before committing to the real run.
+
+run_name: smoke
+runs_root: /data/artifacts/frank/misc/runs
+
+data_root: /data/artifacts/frank/misc
+labels_csv: /data/artifacts/frank/misc/labels/train2023.csv
+test_ids_csv: /data/artifacts/frank/misc/labels/test_ids.csv
+val_frac: 0.1
+split_seed: 42
+
+image_size: 768
+
+dinov3_repo: /data/artifacts/frank/misc/dinov3_repo
+dinov3_arch: dinov3_vith16plus
+dinov3_weights: /data/artifacts/frank/misc/labels/dino/dinov3_hplus.pth
+head_type: attention
+attn_pool_heads: 8
+
+epochs: 100               # huge so max_steps triggers first
+batch_size_per_gpu: 2     # tiny
+num_workers: 0            # no multiprocessing in smoke
+lr_head: 2.0e-5
+lr_backbone: 1.0e-6
+weight_decay: 0.05
+warmup_ratio: 0.05
+grad_clip: 1.0
+mixup_alpha: 0.1
+
+eval_every_steps: 4
+
+seed: 0
+log_every_steps: 1
+
+max_train_samples: 16
+max_val_samples: 128   # enough positives for at least Support Devices / Lung Opacity AUC
+max_steps: 8

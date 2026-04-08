@@ -78,11 +78,14 @@ class Config:
 
     # --- eval / ckpt ---
     eval_every_steps: int = 500
-    keep_last_n_ckpts: int = 2
 
     # --- misc ---
     seed: int = 0
     log_every_steps: int = 20
+    # Smoke / debug knobs. Leave 0 for full runs.
+    max_train_samples: int = 0  # if >0, slice train set to first N rows
+    max_val_samples: int = 0    # if >0, slice val set to first N rows
+    max_steps: int = 0          # if >0, stop training after this many steps
 
     # ------------------------------------------------------------------ #
     # helpers

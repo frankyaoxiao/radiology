@@ -153,14 +153,21 @@ class CheXpertModel(nn.Module):
         puts it in the decay bucket; we special-case it into no-decay
         since it's functionally a learned "position / search" vector.
         """
+        # Explicit no-decay suffixes for learned direction vectors that
+        # are multi-dimensional and therefore missed by the ndim<=1 rule.
+        _NO_DECAY_SUFFIXES = (
+            "cls_token",
+            "storage_tokens",
+            "mask_token",
+            "query",  # attention pool learned query
+        )
+
         def split_decay(named: Iterable[tuple[str, nn.Parameter]]) -> tuple[list, list]:
             decay, no_decay = [], []
             for name, p in named:
                 if not p.requires_grad:
                     continue
-                # biases, LayerNorm weights, cls_token, storage_tokens,
-                # mask_token, attention pool query — all no-decay.
-                if p.ndim <= 1 or name.endswith("query") or "tokens" in name:
+                if p.ndim <= 1 or name.endswith(_NO_DECAY_SUFFIXES):
                     no_decay.append(p)
                 else:
                     decay.append(p)

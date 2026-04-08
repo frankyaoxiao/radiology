@@ -40,6 +40,17 @@ from metrics import per_label_auroc
 from model import CheXpertModel
 
 
+def _json_safe(obj):
+    """Convert nan/inf to None so the output is RFC-8259 JSON, not Python JSON."""
+    if isinstance(obj, float):
+        return obj if math.isfinite(obj) else None
+    if isinstance(obj, dict):
+        return {k: _json_safe(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_json_safe(v) for v in obj]
+    return obj
+
+
 # --------------------------------------------------------------------------- #
 # DDP helpers
 # --------------------------------------------------------------------------- #
@@ -192,6 +203,13 @@ def main() -> None:
     if is_main(rank):
         print(f"[rank 0] loading dataset …", flush=True)
     df_train, df_val, y_train, y_val = load_and_split(cfg)
+    # Smoke / debug subsetting (both 0 in normal runs)
+    if cfg.max_train_samples > 0:
+        df_train = df_train.head(cfg.max_train_samples).reset_index(drop=True)
+        y_train = y_train[: cfg.max_train_samples]
+    if cfg.max_val_samples > 0:
+        df_val = df_val.head(cfg.max_val_samples).reset_index(drop=True)
+        y_val = y_val[: cfg.max_val_samples]
     train_ds = CheXpertDataset(df_train, y_train, cfg.data_root, build_train_transform(cfg))
     val_ds = CheXpertDataset(df_val, y_val, cfg.data_root, build_val_transform(cfg))
     if is_main(rank):
@@ -234,6 +252,8 @@ def main() -> None:
 
     steps_per_epoch = len(train_loader)
     total_steps = steps_per_epoch * cfg.epochs
+    if cfg.max_steps > 0:
+        total_steps = min(total_steps, cfg.max_steps)
     scheduler = build_scheduler(optimizer, total_steps, cfg.warmup_ratio)
 
     if is_main(rank):
@@ -250,6 +270,21 @@ def main() -> None:
     if is_main(rank):
         metrics_path.touch(exist_ok=True)
 
+    # Running stats for the current eval window. loss_sum / grad_sum
+    # stay on the GPU as 0-d tensors so accumulating them does not
+    # trigger a host-device sync on every step; we only .item() them
+    # at log / eval boundaries. (DDP synchronizes grads on backward(),
+    # so grad_norm is identical across ranks.)
+    def fresh_accum() -> dict:
+        return {
+            "loss_sum": torch.zeros((), device=device),
+            "grad_sum": torch.zeros((), device=device),
+            "n": 0,
+            "samples": 0,
+            "t_start": time.time(),
+        }
+
+    accum = fresh_accum()
     t_loop_start = time.time()
     model.train()
     for epoch in range(cfg.epochs):
@@ -258,6 +293,7 @@ def main() -> None:
             global_step += 1
             x = x.to(device, non_blocking=True)
             y = y.to(device, non_blocking=True)
+            local_bs = x.size(0)
 
             x, y = mixup_batch(x, y, cfg.mixup_alpha)
 
@@ -267,18 +303,30 @@ def main() -> None:
 
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(inner.parameters(), cfg.grad_clip)
+            grad_norm = torch.nn.utils.clip_grad_norm_(inner.parameters(), cfg.grad_clip)
             optimizer.step()
             scheduler.step()
+
+            # Accumulate running stats on-device. No .item() here —
+            # that would force a host/device sync every step and
+            # serialise the pipeline.
+            accum["loss_sum"] += loss.detach()
+            accum["grad_sum"] += grad_norm.detach()
+            accum["n"] += 1
+            accum["samples"] += local_bs * world_size
 
             if is_main(rank) and global_step % cfg.log_every_steps == 0:
                 lr_bb = optimizer.param_groups[0]["lr"]
                 lr_hd = optimizer.param_groups[-1]["lr"]
                 elapsed = time.time() - t_loop_start
+                # These .item() calls are the ONLY per-log-interval sync points.
+                step_loss = loss.detach().item()
+                step_gn = grad_norm.detach().item()
                 print(
                     f"step {global_step:>6,}/{total_steps:<6,}  "
                     f"epoch {epoch+1}/{cfg.epochs}  "
-                    f"loss {loss.item():.4f}  "
+                    f"loss {step_loss:.4f}  "
+                    f"gn {step_gn:.2f}  "
                     f"lr_bb {lr_bb:.2e}  lr_hd {lr_hd:.2e}  "
                     f"elapsed {elapsed:>6.0f}s",
                     flush=True,
@@ -288,32 +336,59 @@ def main() -> None:
                 metrics = evaluate(model, val_loader, device, cfg, world_size, rank)
                 if is_main(rank):
                     mean_auc = metrics.get("mean", float("nan"))
+                    window_elapsed = time.time() - accum["t_start"]
+                    # Single sync point for all accumulators.
+                    loss_avg = (accum["loss_sum"] / max(1, accum["n"])).item()
+                    gn_avg = (accum["grad_sum"] / max(1, accum["n"])).item()
+                    # Update best_mean_auc BEFORE writing ckpt_last so the
+                    # saved metadata in ckpt_last.pt reflects the most recent
+                    # best (not the one-eval-stale best).
+                    if not math.isnan(mean_auc) and mean_auc > best_mean_auc:
+                        best_mean_auc = mean_auc
+                        is_new_best = True
+                    else:
+                        is_new_best = False
+
                     line = {
                         "step": global_step,
                         "epoch": epoch + 1,
-                        "train_loss": float(loss.item()),
+                        "train_loss_step": loss.detach().item(),
+                        "train_loss_avg": loss_avg,
+                        "grad_norm_avg": gn_avg,
+                        "lr_backbone": optimizer.param_groups[0]["lr"],
+                        "lr_head": optimizer.param_groups[-1]["lr"],
+                        "samples_per_sec": accum["samples"] / window_elapsed if window_elapsed > 0 else 0.0,
+                        "elapsed_window_sec": window_elapsed,
+                        "elapsed_total_sec": time.time() - t_loop_start,
                         "val": metrics,
                     }
                     with open(metrics_path, "a") as f:
-                        f.write(json.dumps(line) + "\n")
+                        f.write(json.dumps(_json_safe(line)) + "\n")
                     per_lab = "  ".join(
                         f"{n.split()[0][:4]}:{metrics.get(n, float('nan')):.3f}"
                         for n in cfg.label_names
                     )
                     print(
-                        f"[val @ step {global_step}] mean_auc={mean_auc:.4f}   {per_lab}",
+                        f"[val @ step {global_step}] mean_auc={mean_auc:.4f}  "
+                        f"loss_avg={loss_avg:.4f}  "
+                        f"gn_avg={gn_avg:.2f}  "
+                        f"sps={line['samples_per_sec']:.1f}  |  {per_lab}",
                         flush=True,
                     )
 
-                    # save last
                     save_ckpt(ckpt_dir / "ckpt_last.pt", inner, optimizer, scheduler, global_step, epoch, best_mean_auc, cfg)
-                    # save best
-                    if not math.isnan(mean_auc) and mean_auc > best_mean_auc:
-                        best_mean_auc = mean_auc
+                    if is_new_best:
                         save_ckpt(ckpt_dir / "ckpt_best.pt", inner, optimizer, scheduler, global_step, epoch, best_mean_auc, cfg)
                         print(f"[val @ step {global_step}] new best mean_auc={best_mean_auc:.4f} — saved ckpt_best.pt", flush=True)
+                # reset eval-window accumulators on every rank
+                accum = fresh_accum()
                 if world_size > 1:
                     dist.barrier()
+
+            if cfg.max_steps > 0 and global_step >= cfg.max_steps:
+                break
+        if cfg.max_steps > 0 and global_step >= cfg.max_steps:
+            break
 
     if is_main(rank):
         print(f"done. best mean_auc={best_mean_auc:.4f}", flush=True)

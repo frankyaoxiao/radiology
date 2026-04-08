@@ -42,7 +42,6 @@ mixup_alpha: 0.1
 
 # eval / ckpt
 eval_every_steps: 500
-keep_last_n_ckpts: 2
 
 # misc
 seed: 0

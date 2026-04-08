@@ -52,14 +52,19 @@ class SubmitDataset(Dataset):
         return self.ids[idx], x
 
 
-def load_model(ckpt_path: Path, device: torch.device) -> Tuple[CheXpertModel, Config]:
+def load_model(ckpt_path: Path, device: torch.device) -> Tuple[CheXpertModel, Config, dict]:
     ckpt = torch.load(str(ckpt_path), map_location="cpu", weights_only=False)
     cfg_dict = ckpt["config"]
     cfg = Config(**cfg_dict)
     model = CheXpertModel(cfg)
     model.load_state_dict(ckpt["model"], strict=True)
     model.to(device).eval()
-    return model, cfg
+    meta = {
+        "step": ckpt.get("step"),
+        "epoch": ckpt.get("epoch"),
+        "best_mean_auc": ckpt.get("best_mean_auc"),
+    }
+    return model, cfg, meta
 
 
 def main() -> None:
@@ -72,8 +77,8 @@ def main() -> None:
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"loading ckpt: {args.ckpt}", flush=True)
-    model, cfg = load_model(args.ckpt, device)
-    print(f"  trained step={None}  best_mean_auc={None}", flush=True)
+    model, cfg, meta = load_model(args.ckpt, device)
+    print(f"  trained step={meta['step']}  epoch={meta['epoch']}  best_mean_auc={meta['best_mean_auc']}", flush=True)
 
     # test set
     df = pd.read_csv(cfg.test_ids_csv)
