@@ -8,4 +8,21 @@ wheels/
 
 # Virtual environments
 .venv
+
+# Large data / artifacts (these live outside the repo, but guard in case)
 data.zip
+runs/
+*.pth
+*.pt
+*.ckpt
+
+# SLURM output
+slurm_logs/
+*.out
+*.err
+slurm-*.out
+
+# Local tool caches
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/

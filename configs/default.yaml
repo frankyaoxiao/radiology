@@ -1,0 +1,49 @@
+# Default CheXpert 2023 × DINOv3 ViT-H+/16 config.
+# Copy this file and edit `run_name` before launching each new run.
+# Every field defined in config.py::Config can be overridden here.
+
+run_name: default                              # <-- change per run
+runs_root: /data/artifacts/frank/misc/runs
+
+# data
+data_root: /data/artifacts/frank/misc
+labels_csv: /data/artifacts/frank/misc/labels/train2023.csv
+test_ids_csv: /data/artifacts/frank/misc/labels/test_ids.csv
+val_frac: 0.1
+split_seed: 42
+
+# image
+image_size: 768
+crop_scale_min: 0.85
+crop_scale_max: 1.0
+rotation_deg: 10.0
+brightness: 0.2
+contrast: 0.2
+
+# model (native DINOv3 loader)
+dinov3_repo: /data/artifacts/frank/misc/dinov3_repo
+dinov3_arch: dinov3_vith16plus
+dinov3_weights: /data/artifacts/frank/misc/labels/dino/dinov3_hplus.pth
+# head_type: "attention" (attention pool over all tokens) or "cls" (CLS only)
+head_type: attention
+attn_pool_heads: 8
+
+# optimization
+epochs: 5
+# 4× H100 × 8 = global batch 32. bs=16 OOMs at 768² on ViT-H+ (ffn_ratio=6.0).
+batch_size_per_gpu: 8
+num_workers: 8
+lr_head: 1.0e-3
+lr_backbone: 1.0e-5
+weight_decay: 0.05
+warmup_ratio: 0.05
+grad_clip: 1.0
+mixup_alpha: 0.1
+
+# eval / ckpt
+eval_every_steps: 500
+keep_last_n_ckpts: 2
+
+# misc
+seed: 0
+log_every_steps: 20
