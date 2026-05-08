@@ -255,20 +255,77 @@ class CheXpertDataset(Dataset):
         y: np.ndarray,
         data_root: str | Path,
         transform: Callable,
+        clahe: bool = False,
+        clahe_clip_limit: float = 2.0,
+        clahe_tile_size: int = 8,
+        multiview_blend: bool = False,
+        multiview_blend_prob: float = 0.3,
+        multiview_blend_alpha_min: float = 0.3,
+        multiview_blend_alpha_max: float = 0.7,
     ) -> None:
         assert len(df) == len(y), f"{len(df)} rows vs {len(y)} labels"
         self.paths: List[str] = df["Path"].tolist()
         self.y = y
         self.data_root = Path(data_root)
         self.transform = transform
+        self.clahe = clahe
+        if clahe:
+            import cv2
+            self._clahe = cv2.createCLAHE(
+                clipLimit=clahe_clip_limit,
+                tileGridSize=(clahe_tile_size, clahe_tile_size),
+            )
+        self.multiview_blend = multiview_blend
+        self.multiview_blend_prob = multiview_blend_prob
+        self.multiview_blend_alpha_min = multiview_blend_alpha_min
+        self.multiview_blend_alpha_max = multiview_blend_alpha_max
+        if multiview_blend:
+            import re
+            self._study_to_indices: dict[str, List[int]] = {}
+            for i, p in enumerate(self.paths):
+                m = re.search(r"(pid\d+/study\d+)", p)
+                if m:
+                    study = m.group(1)
+                    self._study_to_indices.setdefault(study, []).append(i)
+            n_multi = sum(1 for v in self._study_to_indices.values() if len(v) > 1)
+            print(f"[multiview_blend] {n_multi} studies with 2+ views", flush=True)
 
     def __len__(self) -> int:
         return len(self.paths)
 
-    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
+    def _apply_clahe(self, img: Image.Image) -> Image.Image:
+        """Apply CLAHE to a PIL image: convert to grayscale, equalize, back to RGB."""
+        gray = np.array(img.convert("L"))
+        equalized = self._clahe.apply(gray)
+        return Image.fromarray(equalized).convert("RGB")
+
+    def _load_and_transform(self, idx: int) -> torch.Tensor:
         full = self.data_root / self.paths[idx]
         with Image.open(full) as img:
-            img = img.convert("RGB")  # grayscale → 3-channel
-            x = self.transform(img)
+            if self.clahe:
+                img = self._apply_clahe(img)
+            else:
+                img = img.convert("RGB")
+            return self.transform(img)
+
+    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
+        x = self._load_and_transform(idx)
         y = torch.from_numpy(np.array(self.y[idx]))
+
+        if self.multiview_blend and np.random.random() < self.multiview_blend_prob:
+            import re
+            m = re.search(r"(pid\d+/study\d+)", self.paths[idx])
+            if m:
+                study = m.group(1)
+                partners = self._study_to_indices.get(study, [])
+                others = [i for i in partners if i != idx]
+                if others:
+                    other_idx = others[np.random.randint(len(others))]
+                    x2 = self._load_and_transform(other_idx)
+                    alpha = np.random.uniform(
+                        self.multiview_blend_alpha_min,
+                        self.multiview_blend_alpha_max,
+                    )
+                    x = alpha * x + (1 - alpha) * x2
+
         return x, y

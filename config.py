@@ -48,6 +48,17 @@ class Config:
     contrast: float = 0.2
     hflip: bool = False
 
+    # --- preprocessing ---
+    clahe: bool = False
+    clahe_clip_limit: float = 2.0
+    clahe_tile_size: int = 8
+
+    # --- multi-view blending ---
+    multiview_blend: bool = False
+    multiview_blend_prob: float = 0.3
+    multiview_blend_alpha_min: float = 0.3
+    multiview_blend_alpha_max: float = 0.7
+
     # --- labels ---
     # label_names: every label the MODEL is trained on. Default is the 9 scored
     # labels. For 14-label aux training, set this to the full 14-label list
@@ -82,6 +93,11 @@ class Config:
     # DenseNet-121 / ConvNeXt settings
     dropout: float = 0.5
     convnext_weights: str = ""
+    # RAD-DINO (microsoft/rad-dino): HuggingFace model ID or local path.
+    rad_dino_path: str = "microsoft/rad-dino"
+    # Which hidden layer to use for patch tokens in attention pooling.
+    # -1 = last layer, -2 = second-to-last, etc. Only used with head_type="attention".
+    rad_dino_layer: int = -2
     # Native DINOv3 loader: we call torch.hub.load on a local clone of
     # facebookresearch/dinov3 and point at a downloaded .pth. The HF repo
     # is gated; bypassing HF avoids the access barrier.
@@ -90,7 +106,7 @@ class Config:
     dinov3_weights: str = "/data/artifacts/frank/misc/labels/dino/dinov3_hplus.pth"
     # Head type: "attention" (attention pooling over CLS + storage + patches)
     # or "cls" (linear on CLS token only).
-    head_type: str = "attention"
+    head_type: str = "cls"
     attn_pool_heads: int = 8
 
     # --- optimization ---

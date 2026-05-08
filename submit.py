@@ -101,18 +101,43 @@ def build_tta_transforms(cfg: Config) -> List:
 class SubmitDataset(Dataset):
     """Minimal dataset that iterates rows of test_ids.csv."""
 
-    def __init__(self, df: pd.DataFrame, data_root: str, transform) -> None:
+    def __init__(
+        self,
+        df: pd.DataFrame,
+        data_root: str,
+        transform,
+        clahe: bool = False,
+        clahe_clip_limit: float = 2.0,
+        clahe_tile_size: int = 8,
+    ) -> None:
         self.ids: List[int] = df["Id"].tolist()
         self.paths: List[str] = df["Path"].tolist()
         self.root = Path(data_root)
         self.transform = transform
+        self.clahe = clahe
+        if clahe:
+            import cv2
+            self._clahe = cv2.createCLAHE(
+                clipLimit=clahe_clip_limit,
+                tileGridSize=(clahe_tile_size, clahe_tile_size),
+            )
 
     def __len__(self) -> int:
         return len(self.ids)
 
+    def _apply_clahe(self, img: Image.Image) -> Image.Image:
+        """Apply CLAHE to a PIL image: convert to grayscale, equalize, back to RGB."""
+        import numpy as np
+        gray = np.array(img.convert("L"))
+        equalized = self._clahe.apply(gray)
+        return Image.fromarray(equalized).convert("RGB")
+
     def __getitem__(self, idx: int) -> Tuple[int, torch.Tensor]:
         with Image.open(self.root / self.paths[idx]) as img:
-            img = img.convert("RGB")
+            if self.clahe:
+                img = self._apply_clahe(img)
+            else:
+                img = img.convert("RGB")
             x = self.transform(img)
         return self.ids[idx], x
 
@@ -120,16 +145,41 @@ class SubmitDataset(Dataset):
 class SubmitDatasetRaw(Dataset):
     """Returns PIL images (not transformed) so TTA can apply multiple transforms."""
 
-    def __init__(self, df: pd.DataFrame, data_root: str) -> None:
+    def __init__(
+        self,
+        df: pd.DataFrame,
+        data_root: str,
+        clahe: bool = False,
+        clahe_clip_limit: float = 2.0,
+        clahe_tile_size: int = 8,
+    ) -> None:
         self.ids: List[int] = df["Id"].tolist()
         self.paths: List[str] = df["Path"].tolist()
         self.root = Path(data_root)
+        self.clahe = clahe
+        if clahe:
+            import cv2
+            self._clahe = cv2.createCLAHE(
+                clipLimit=clahe_clip_limit,
+                tileGridSize=(clahe_tile_size, clahe_tile_size),
+            )
 
     def __len__(self) -> int:
         return len(self.ids)
 
+    def _apply_clahe(self, img: Image.Image) -> Image.Image:
+        """Apply CLAHE to a PIL image: convert to grayscale, equalize, back to RGB."""
+        import numpy as np
+        gray = np.array(img.convert("L"))
+        equalized = self._clahe.apply(gray)
+        return Image.fromarray(equalized).convert("RGB")
+
     def __getitem__(self, idx: int) -> Tuple[int, Image.Image]:
-        img = Image.open(self.root / self.paths[idx]).convert("RGB")
+        img = Image.open(self.root / self.paths[idx])
+        if self.clahe:
+            img = self._apply_clahe(img)
+        else:
+            img = img.convert("RGB")
         return self.ids[idx], img
 
 
@@ -195,7 +245,11 @@ def run_inference_tta(
     all_ids = None
 
     for view_idx, tfm in enumerate(tta_transforms):
-        ds = SubmitDataset(df, cfg.data_root, tfm)
+        ds = SubmitDataset(
+            df, cfg.data_root, tfm,
+            clahe=cfg.clahe, clahe_clip_limit=cfg.clahe_clip_limit,
+            clahe_tile_size=cfg.clahe_tile_size,
+        )
         loader = DataLoader(
             ds, batch_size=batch_size, shuffle=False,
             num_workers=num_workers, pin_memory=True,
@@ -328,7 +382,11 @@ def main() -> None:
                 num_workers=args.num_workers,
             )
         else:
-            ds = SubmitDataset(df, model_cfg.data_root, build_val_transform(model_cfg))
+            ds = SubmitDataset(
+                df, model_cfg.data_root, build_val_transform(model_cfg),
+                clahe=model_cfg.clahe, clahe_clip_limit=model_cfg.clahe_clip_limit,
+                clahe_tile_size=model_cfg.clahe_tile_size,
+            )
             loader = DataLoader(
                 ds, batch_size=args.batch_size, shuffle=False,
                 num_workers=args.num_workers, pin_memory=True,

@@ -49,11 +49,19 @@ def main():
     # Load val data
     _, df_val, _, y_val = load_and_split(cfg)
     val_transform = build_val_transform(cfg)
-    val_ds = CheXpertDataset(df_val, y_val, cfg.data_root, val_transform)
+    val_ds = CheXpertDataset(
+        df_val, y_val, cfg.data_root, val_transform,
+        clahe=cfg.clahe, clahe_clip_limit=cfg.clahe_clip_limit,
+        clahe_tile_size=cfg.clahe_tile_size,
+    )
 
     # Load test data
     df_test = pd.read_csv(cfg.test_ids_csv)
-    test_ds = SubmitDataset(df_test, cfg.data_root, val_transform)
+    test_ds = SubmitDataset(
+        df_test, cfg.data_root, val_transform,
+        clahe=cfg.clahe, clahe_clip_limit=cfg.clahe_clip_limit,
+        clahe_tile_size=cfg.clahe_tile_size,
+    )
 
     print(f"val: {len(val_ds)}, test: {len(test_ds)}", flush=True)
 
@@ -100,6 +108,13 @@ def main():
         cfg_dict = ckpt["config"]
         known = {f.name for f in Config.__dataclass_fields__.values()}
         cfg_dict = {k: v for k, v in cfg_dict.items() if k in known}
+        # Detect actual head type from state_dict keys to handle checkpoints
+        # saved with wrong default head_type.
+        sd_keys = set(ckpt["model"].keys())
+        if "classifier.weight" in sd_keys and "head.query" not in sd_keys:
+            cfg_dict["head_type"] = "cls"
+        elif "head.query" in sd_keys and "classifier.weight" not in sd_keys:
+            cfg_dict["head_type"] = "attention"
         cfg_i = Config(**cfg_dict)
         model = CheXpertModel(cfg_i, pretrained=False)
         model.load_state_dict(ckpt["model"], strict=True)
@@ -128,6 +143,11 @@ def main():
         cfg_dict = ckpt["config"]
         known = {f.name for f in Config.__dataclass_fields__.values()}
         cfg_dict = {k: v for k, v in cfg_dict.items() if k in known}
+        sd_keys = set(ckpt["model"].keys())
+        if "classifier.weight" in sd_keys and "head.query" not in sd_keys:
+            cfg_dict["head_type"] = "cls"
+        elif "head.query" in sd_keys and "classifier.weight" not in sd_keys:
+            cfg_dict["head_type"] = "attention"
         cfg_i = Config(**cfg_dict)
         model = CheXpertModel(cfg_i, pretrained=False)
         model.load_state_dict(ckpt["model"], strict=True)

@@ -60,7 +60,7 @@ def _validate_config(cfg: Config) -> None:
             raise FileNotFoundError(f"cfg.{attr}={p} does not exist")
     if cfg.model_type == "dinov3" and cfg.head_type not in ("cls", "attention"):
         raise ValueError(f"cfg.head_type must be 'cls' or 'attention', got {cfg.head_type!r}")
-    valid_models = ("dinov3", "densenet121", "convnext_base", "convnext_small")
+    valid_models = ("dinov3", "densenet121", "convnext_base", "convnext_small", "rad_dino")
     if cfg.model_type not in valid_models:
         raise ValueError(f"cfg.model_type must be one of {valid_models}, got {cfg.model_type!r}")
     if cfg.target_type not in ("binary", "raw", "3class"):
@@ -393,8 +393,20 @@ def main() -> None:
     if cfg.max_val_samples > 0:
         df_val = df_val.head(cfg.max_val_samples).reset_index(drop=True)
         y_val = y_val[: cfg.max_val_samples]
-    train_ds = CheXpertDataset(df_train, y_train, cfg.data_root, build_train_transform(cfg))
-    val_ds = CheXpertDataset(df_val, y_val, cfg.data_root, build_val_transform(cfg))
+    train_ds = CheXpertDataset(
+        df_train, y_train, cfg.data_root, build_train_transform(cfg),
+        clahe=cfg.clahe, clahe_clip_limit=cfg.clahe_clip_limit,
+        clahe_tile_size=cfg.clahe_tile_size,
+        multiview_blend=cfg.multiview_blend,
+        multiview_blend_prob=cfg.multiview_blend_prob,
+        multiview_blend_alpha_min=cfg.multiview_blend_alpha_min,
+        multiview_blend_alpha_max=cfg.multiview_blend_alpha_max,
+    )
+    val_ds = CheXpertDataset(
+        df_val, y_val, cfg.data_root, build_val_transform(cfg),
+        clahe=cfg.clahe, clahe_clip_limit=cfg.clahe_clip_limit,
+        clahe_tile_size=cfg.clahe_tile_size,
+    )
     if is_main(rank):
         print(f"[rank 0] train={len(train_ds):,}  val={len(val_ds):,}", flush=True)
 

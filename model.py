@@ -1,10 +1,12 @@
 """Model backbones for CheXpert classification.
 
-Supports two model types (selected via cfg.model_type):
+Supports model types (selected via cfg.model_type):
 
   - "dinov3": DINOv3 ViT-H+/16 (840M params) with attention pool or CLS head.
   - "densenet121": torchvision DenseNet-121 (7M params) with ImageNet pretraining,
     GAP + dropout + linear head.
+  - "rad_dino": microsoft/rad-dino ViT-B/14 (86M params) pretrained on chest X-rays,
+    CLS token + dropout + linear head.
 """
 from __future__ import annotations
 
@@ -305,6 +307,91 @@ class ConvNeXtModel(nn.Module):
 
 
 # --------------------------------------------------------------------------- #
+# RAD-DINO backbone (microsoft/rad-dino via HuggingFace transformers)
+# --------------------------------------------------------------------------- #
+class RadDinoModel(nn.Module):
+    """RAD-DINO ViT-B/14 pretrained on ~800K chest X-rays.
+
+    Supports head_type="cls" (dropout + linear on CLS token) or
+    "attention" (attention pooling over CLS + patch tokens).
+    """
+
+    def __init__(self, cfg: Config, pretrained: bool = True) -> None:
+        super().__init__()
+        self.cfg = cfg
+        self.num_classes_per_label = 3 if cfg.target_type == "3class" else 1
+        from transformers import Dinov2Model
+        model_path = cfg.rad_dino_path
+        if pretrained:
+            self.backbone = Dinov2Model.from_pretrained(model_path)
+        else:
+            from transformers import Dinov2Config
+            config = Dinov2Config.from_pretrained(model_path)
+            self.backbone = Dinov2Model(config)
+        self.hidden_dim = 768
+        out_dim = cfg.num_labels * self.num_classes_per_label
+        self.head_type = cfg.head_type
+        if self.head_type == "attention":
+            self.head = AttentionPoolHead(self.hidden_dim, out_dim, num_heads=cfg.attn_pool_heads)
+        else:
+            self.drop = nn.Dropout(p=cfg.dropout)
+            self.classifier = nn.Linear(self.hidden_dim, out_dim)
+            nn.init.trunc_normal_(self.classifier.weight, std=0.02)
+            nn.init.zeros_(self.classifier.bias)
+
+    def forward(self, pixel_values: torch.Tensor) -> torch.Tensor:
+        use_hidden = self.head_type == "attention"
+        outputs = self.backbone(pixel_values=pixel_values, output_hidden_states=use_hidden)
+        if self.head_type == "attention":
+            hidden = outputs.hidden_states[self.cfg.rad_dino_layer]
+            feats = {
+                "x_norm_clstoken": outputs.last_hidden_state[:, 0, :],
+                "x_storage_tokens": hidden[:, :0, :],
+                "x_norm_patchtokens": hidden[:, 1:, :],
+            }
+            out = self.head(feats)
+        else:
+            cls_token = outputs.last_hidden_state[:, 0, :]
+            cls_token = self.drop(cls_token)
+            out = self.classifier(cls_token)
+        if self.num_classes_per_label == 3:
+            return out.view(-1, self.cfg.num_labels, 3)
+        return out
+
+    def param_groups(
+        self,
+        lr_backbone: float,
+        lr_head: float,
+        weight_decay: float,
+    ) -> List[dict]:
+        def split_decay(named: Iterable[tuple[str, nn.Parameter]]) -> tuple[list, list]:
+            decay, no_decay = [], []
+            for name, p in named:
+                if not p.requires_grad:
+                    continue
+                if p.ndim <= 1:
+                    no_decay.append(p)
+                else:
+                    decay.append(p)
+            return decay, no_decay
+
+        bb_decay, bb_no_decay = split_decay(self.backbone.named_parameters())
+        if self.head_type == "attention":
+            head_params = self.head.named_parameters()
+        else:
+            head_params = list(self.classifier.named_parameters())
+        hd_decay, hd_no_decay = split_decay(head_params)
+
+        groups = [
+            {"params": bb_decay,    "lr": lr_backbone, "weight_decay": weight_decay, "name": "backbone_decay"},
+            {"params": bb_no_decay, "lr": lr_backbone, "weight_decay": 0.0,          "name": "backbone_nodecay"},
+            {"params": hd_decay,    "lr": lr_head,     "weight_decay": weight_decay, "name": "head_decay"},
+            {"params": hd_no_decay, "lr": lr_head,     "weight_decay": 0.0,          "name": "head_nodecay"},
+        ]
+        return [g for g in groups if len(g["params"]) > 0]
+
+
+# --------------------------------------------------------------------------- #
 # factory
 # --------------------------------------------------------------------------- #
 # Backward-compatible alias used by train.py and submit.py
@@ -315,5 +402,7 @@ def CheXpertModel(cfg: Config, pretrained: bool = True) -> nn.Module:
         return ConvNeXtModel(cfg, pretrained=pretrained)
     elif cfg.model_type == "dinov3":
         return CheXpertDINOv3Model(cfg)
+    elif cfg.model_type == "rad_dino":
+        return RadDinoModel(cfg, pretrained=pretrained)
     else:
         raise ValueError(f"unknown model_type: {cfg.model_type!r}")

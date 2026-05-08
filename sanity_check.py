@@ -44,6 +44,29 @@ TRAIN_PREVALENCE = {
     "Support Devices": 0.527,
 }
 
+# Raw -1/0/1 scale: train mean of non-NaN labels (including uncertain=0)
+TRAIN_RAW_MEAN = {
+    "No Finding": -0.735,
+    "Enlarged Cardiomediastinum": -0.276,
+    "Cardiomegaly": 0.191,
+    "Lung Opacity": 0.836,
+    "Pneumonia": 0.031,
+    "Pleural Effusion": 0.385,
+    "Pleural Other": 0.522,
+    "Fracture": 0.392,
+    "Support Devices": 0.888,
+}
+
+def detect_scale(df: pd.DataFrame) -> str:
+    """Detect if submission is binary [0,1] or raw [-1,1] scale."""
+    for label in LABEL_NAMES:
+        if label not in df.columns:
+            continue
+        if (df[label] < -0.01).any():
+            return "raw"
+    return "binary"
+
+
 def check_format(df: pd.DataFrame, test_ids_csv: Path | None = None) -> list[str]:
     errors = []
     if "Id" not in df.columns:
@@ -54,14 +77,16 @@ def check_format(df: pd.DataFrame, test_ids_csv: Path | None = None) -> list[str
             errors.append(f"FAIL: missing column '{label}'")
     if len(df) == 0:
         errors.append("FAIL: CSV has 0 rows")
+    scale = detect_scale(df)
+    lo, hi = (-1, 1) if scale == "raw" else (0, 1)
     for label in LABEL_NAMES:
         if label not in df.columns:
             continue
         vals = df[label]
         if vals.isna().any():
             errors.append(f"FAIL: {label} has {vals.isna().sum()} NaN values")
-        if (vals < 0).any() or (vals > 1).any():
-            errors.append(f"FAIL: {label} has values outside [0, 1]")
+        if (vals < lo).any() or (vals > hi).any():
+            errors.append(f"FAIL: {label} has values outside [{lo}, {hi}]")
     # ID checks
     if df["Id"].duplicated().any():
         n_dup = df["Id"].duplicated().sum()
@@ -83,28 +108,45 @@ def check_format(df: pd.DataFrame, test_ids_csv: Path | None = None) -> list[str
 def check_prevalence(df: pd.DataFrame) -> list[str]:
     """Flag if mean prediction is wildly different from training prevalence."""
     warnings = []
+    scale = detect_scale(df)
+    ref = TRAIN_RAW_MEAN if scale == "raw" else TRAIN_PREVALENCE
+    label_type = "raw mean" if scale == "raw" else "prevalence"
+
     for label in LABEL_NAMES:
         if label not in df.columns:
             continue
         mean_pred = df[label].mean()
-        prev = TRAIN_PREVALENCE[label]
-        ratio = mean_pred / prev if prev > 0 else float("inf")
+        expected = ref[label]
+        diff = abs(mean_pred - expected)
 
-        if ratio > 3.0:
-            warnings.append(
-                f"FAIL: {label} mean prediction {mean_pred:.3f} is {ratio:.1f}x "
-                f"training prevalence {prev:.3f} — likely inflated"
-            )
-        elif ratio > 2.0:
-            warnings.append(
-                f"WARN: {label} mean prediction {mean_pred:.3f} is {ratio:.1f}x "
-                f"training prevalence {prev:.3f}"
-            )
-        elif ratio < 0.3:
-            warnings.append(
-                f"WARN: {label} mean prediction {mean_pred:.3f} is only {ratio:.1f}x "
-                f"training prevalence {prev:.3f} — possibly suppressed"
-            )
+        if scale == "raw":
+            if diff > 0.5:
+                warnings.append(
+                    f"FAIL: {label} mean {mean_pred:+.3f} is {diff:.3f} from "
+                    f"train {label_type} {expected:+.3f}"
+                )
+            elif diff > 0.2:
+                warnings.append(
+                    f"WARN: {label} mean {mean_pred:+.3f} is {diff:.3f} from "
+                    f"train {label_type} {expected:+.3f}"
+                )
+        else:
+            ratio = mean_pred / expected if expected > 0 else float("inf")
+            if ratio > 3.0:
+                warnings.append(
+                    f"FAIL: {label} mean prediction {mean_pred:.3f} is {ratio:.1f}x "
+                    f"training {label_type} {expected:.3f} — likely inflated"
+                )
+            elif ratio > 2.0:
+                warnings.append(
+                    f"WARN: {label} mean prediction {mean_pred:.3f} is {ratio:.1f}x "
+                    f"training {label_type} {expected:.3f}"
+                )
+            elif ratio < 0.3:
+                warnings.append(
+                    f"WARN: {label} mean prediction {mean_pred:.3f} is only {ratio:.1f}x "
+                    f"training {label_type} {expected:.3f} — possibly suppressed"
+                )
     return warnings
 
 
@@ -141,26 +183,44 @@ def check_distribution(df: pd.DataFrame) -> list[str]:
 def check_no_blowup(df: pd.DataFrame) -> list[str]:
     """Estimate which labels would produce NMSE > 2.0 based on prediction mean."""
     warnings = []
+    scale = detect_scale(df)
+    ref = TRAIN_RAW_MEAN if scale == "raw" else TRAIN_PREVALENCE
+
     for label in LABEL_NAMES:
         if label not in df.columns:
             continue
         mean_pred = df[label].mean()
-        prev = TRAIN_PREVALENCE[label]
-        var = prev * (1 - prev)
-        if var <= 0:
-            continue
-        mse_estimate = (mean_pred - prev) ** 2
-        nmse_estimate = mse_estimate / var
-        if nmse_estimate > 1.5:
-            warnings.append(
-                f"FAIL: {label} estimated NMSE from mean alone is {nmse_estimate:.2f} "
-                f"(pred_mean={mean_pred:.3f}, prev={prev:.3f}) — will blow up"
-            )
-        elif nmse_estimate > 0.5:
-            warnings.append(
-                f"WARN: {label} estimated NMSE from mean alone is {nmse_estimate:.2f} "
-                f"(pred_mean={mean_pred:.3f}, prev={prev:.3f})"
-            )
+        expected = ref[label]
+        if scale == "raw":
+            # For raw scale, compute rough NMSE = (mean_pred - mean_true)^2 / Var(y)
+            # Use train variance. Binary indicators are Bernoulli, but raw labels
+            # have a wider range. Use rough estimate based on prevalence.
+            prev = TRAIN_PREVALENCE[label]
+            # Raw label variance: fraction_pos * (1 - mean)^2 + fraction_neg * (-1 - mean)^2 + ...
+            # Simpler: just flag if mean is way off expected
+            diff = abs(mean_pred - expected)
+            if diff > 0.3:
+                warnings.append(
+                    f"WARN: {label} mean {mean_pred:+.3f} differs by {diff:.3f} from "
+                    f"train mean {expected:+.3f} — check calibration"
+                )
+        else:
+            prev = expected
+            var = prev * (1 - prev)
+            if var <= 0:
+                continue
+            mse_estimate = (mean_pred - prev) ** 2
+            nmse_estimate = mse_estimate / var
+            if nmse_estimate > 1.5:
+                warnings.append(
+                    f"FAIL: {label} estimated NMSE from mean alone is {nmse_estimate:.2f} "
+                    f"(pred_mean={mean_pred:.3f}, prev={prev:.3f}) — will blow up"
+                )
+            elif nmse_estimate > 0.5:
+                warnings.append(
+                    f"WARN: {label} estimated NMSE from mean alone is {nmse_estimate:.2f} "
+                    f"(pred_mean={mean_pred:.3f}, prev={prev:.3f})"
+                )
     return warnings
 
 
@@ -257,16 +317,19 @@ def main():
         all_issues.extend(issues)
         print("\n".join(issues) if issues else "OK")
 
-    print("\n=== Per-label summary ===")
-    print(f"{'Label':30s}  {'Mean':>8s}  {'Std':>8s}  {'Prevalence':>10s}  {'Ratio':>6s}")
+    scale = detect_scale(df)
+    ref = TRAIN_RAW_MEAN if scale == "raw" else TRAIN_PREVALENCE
+    ref_label = "Train Mean" if scale == "raw" else "Prevalence"
+    print(f"\n=== Per-label summary (scale: {scale}) ===")
+    print(f"{'Label':30s}  {'Mean':>8s}  {'Std':>8s}  {ref_label:>10s}  {'Diff':>8s}")
     for label in LABEL_NAMES:
         if label not in df.columns:
             continue
         m = df[label].mean()
         s = df[label].std()
-        p = TRAIN_PREVALENCE[label]
-        r = m / p if p > 0 else float("inf")
-        print(f"  {label:28s}  {m:8.4f}  {s:8.4f}  {p:10.3f}  {r:6.1f}x")
+        p = ref[label]
+        d = m - p
+        print(f"  {label:28s}  {m:+8.4f}  {s:8.4f}  {p:+10.3f}  {d:+8.4f}")
 
     fails = [i for i in all_issues if i.startswith("FAIL")]
     warns = [i for i in all_issues if i.startswith("WARN")]
