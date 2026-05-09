@@ -51,14 +51,45 @@ def _json_safe(obj):
 
 def _validate_config(cfg: Config) -> None:
     """Fast sanity checks that should fire before the model is constructed."""
-    for attr in ("labels_csv", "test_ids_csv", "dinov3_repo", "dinov3_weights", "data_root"):
+    required_paths = ["labels_csv", "test_ids_csv", "data_root"]
+    if cfg.model_type == "dinov3":
+        required_paths += ["dinov3_repo", "dinov3_weights"]
+    for attr in required_paths:
         p = Path(getattr(cfg, attr))
         if not p.exists():
             raise FileNotFoundError(f"cfg.{attr}={p} does not exist")
-    if cfg.head_type not in ("cls", "attention"):
+    if cfg.model_type == "dinov3" and cfg.head_type not in ("cls", "attention"):
         raise ValueError(f"cfg.head_type must be 'cls' or 'attention', got {cfg.head_type!r}")
+    valid_models = ("dinov3", "densenet121", "convnext_base", "convnext_small", "rad_dino")
+    if cfg.model_type not in valid_models:
+        raise ValueError(f"cfg.model_type must be one of {valid_models}, got {cfg.model_type!r}")
+    if cfg.target_type not in ("binary", "raw", "3class"):
+        raise ValueError(f"cfg.target_type must be 'binary', 'raw', or '3class', got {cfg.target_type!r}")
+    if cfg.loss_fn not in ("bce", "mse", "smooth_l1", "ce"):
+        raise ValueError(f"cfg.loss_fn must be 'bce', 'mse', 'smooth_l1', or 'ce', got {cfg.loss_fn!r}")
     if cfg.num_labels != len(cfg.label_names):
         raise ValueError(f"cfg.num_labels={cfg.num_labels} != len(label_names)={len(cfg.label_names)}")
+    valid_label_strategies = {"ones", "zeros", "ignore"}
+    if cfg.default_uncertain_strategy not in valid_label_strategies:
+        raise ValueError(
+            "cfg.default_uncertain_strategy must be one of "
+            f"{sorted(valid_label_strategies)}, got {cfg.default_uncertain_strategy!r}"
+        )
+    if cfg.blank_strategy not in valid_label_strategies:
+        raise ValueError(
+            f"cfg.blank_strategy must be one of {sorted(valid_label_strategies)}, "
+            f"got {cfg.blank_strategy!r}"
+        )
+    if cfg.uncertain_strategy:
+        bad = {
+            name: strategy
+            for name, strategy in cfg.uncertain_strategy.items()
+            if strategy not in valid_label_strategies
+        }
+        if bad:
+            raise ValueError(f"cfg.uncertain_strategy has invalid entries: {bad}")
+    if cfg.loss_reduction not in ("micro", "macro"):
+        raise ValueError(f"cfg.loss_reduction must be 'micro' or 'macro', got {cfg.loss_reduction!r}")
     if cfg.epochs <= 0:
         raise ValueError(f"cfg.epochs must be > 0, got {cfg.epochs}")
     if cfg.batch_size_per_gpu <= 0:
@@ -116,14 +147,129 @@ def mixup_batch(
     """Multi-label mixup: blend image pairs and label pairs by lam ~ Beta(a, a).
 
     Works natively with BCE (fractional targets are valid).
+    NaN-aware: if either sample in a pair has NaN for a label, the mixed
+    label is set to NaN (will be masked from loss).
     """
     if alpha <= 0:
         return x, y
     lam = float(np.random.beta(alpha, alpha))
     perm = torch.randperm(x.size(0), device=x.device)
     x = lam * x + (1.0 - lam) * x[perm]
-    y = lam * y + (1.0 - lam) * y[perm]
-    return x, y
+    # NaN-aware label mixing: propagate NaN from either source
+    y_perm = y[perm]
+    nan_either = torch.isnan(y) | torch.isnan(y_perm)
+    y_mixed = lam * y.nan_to_num(0.0) + (1.0 - lam) * y_perm.nan_to_num(0.0)
+    y_mixed[nan_either] = float("nan")
+    return x, y_mixed
+
+
+def masked_bce_with_logits(
+    logits: torch.Tensor,
+    targets: torch.Tensor,
+    *,
+    reduction: str = "micro",
+) -> torch.Tensor:
+    """BCEWithLogits with NaN targets masked out.
+
+    reduction="micro" averages across every valid (sample, label) element,
+    matching the original code. reduction="macro" first averages valid
+    examples within each label, then averages labels equally. Labels with
+    zero valid examples in the batch are skipped.
+    """
+    nan_mask = torch.isnan(targets)
+    targets_safe = targets.nan_to_num(0.0)
+    per_elem_loss = F.binary_cross_entropy_with_logits(
+        logits, targets_safe, reduction="none",
+    )
+    valid = ~nan_mask
+    per_elem_loss = per_elem_loss * valid
+
+    if reduction == "micro":
+        return per_elem_loss.sum() / valid.sum().clamp(min=1)
+
+    if reduction == "macro":
+        valid_per_label = valid.sum(dim=0)
+        loss_per_label = per_elem_loss.sum(dim=0) / valid_per_label.clamp(min=1)
+        has_label = valid_per_label > 0
+        if has_label.any():
+            return loss_per_label[has_label].mean()
+        return logits.sum() * 0.0
+
+    raise ValueError(f"unknown loss reduction: {reduction!r}")
+
+
+def masked_mse_loss(
+    predictions: torch.Tensor,
+    targets: torch.Tensor,
+    *,
+    reduction: str = "micro",
+    label_weights: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """MSE loss with NaN targets masked out. For raw -1/0/1 target training."""
+    nan_mask = torch.isnan(targets)
+    targets_safe = targets.nan_to_num(0.0)
+    per_elem_loss = (predictions - targets_safe) ** 2
+    valid = ~nan_mask
+    per_elem_loss = per_elem_loss * valid
+
+    if reduction == "micro":
+        if label_weights is not None:
+            per_elem_loss = per_elem_loss * label_weights.unsqueeze(0)
+        return per_elem_loss.sum() / valid.sum().clamp(min=1)
+
+    if reduction == "macro":
+        valid_per_label = valid.sum(dim=0)
+        loss_per_label = per_elem_loss.sum(dim=0) / valid_per_label.clamp(min=1)
+        if label_weights is not None:
+            loss_per_label = loss_per_label * label_weights
+        has_label = valid_per_label > 0
+        if has_label.any():
+            return loss_per_label[has_label].mean()
+        return predictions.sum() * 0.0
+
+    raise ValueError(f"unknown loss reduction: {reduction!r}")
+
+
+def masked_3class_ce_loss(
+    logits_3c: torch.Tensor,
+    targets: torch.Tensor,
+) -> torch.Tensor:
+    """Per-label cross-entropy for 3-class targets. logits_3c: (B, L, 3), targets: (B, L) int64, -100=ignored."""
+    B, L, C = logits_3c.shape
+    loss = F.cross_entropy(
+        logits_3c.reshape(B * L, C),
+        targets.reshape(B * L),
+        ignore_index=-100,
+        reduction="mean",
+    )
+    return loss
+
+
+def masked_smooth_l1_loss(
+    predictions: torch.Tensor,
+    targets: torch.Tensor,
+    *,
+    reduction: str = "micro",
+) -> torch.Tensor:
+    """Smooth L1 loss with NaN targets masked out."""
+    nan_mask = torch.isnan(targets)
+    targets_safe = targets.nan_to_num(0.0)
+    per_elem_loss = F.smooth_l1_loss(predictions, targets_safe, reduction="none")
+    valid = ~nan_mask
+    per_elem_loss = per_elem_loss * valid
+
+    if reduction == "micro":
+        return per_elem_loss.sum() / valid.sum().clamp(min=1)
+
+    if reduction == "macro":
+        valid_per_label = valid.sum(dim=0)
+        loss_per_label = per_elem_loss.sum(dim=0) / valid_per_label.clamp(min=1)
+        has_label = valid_per_label > 0
+        if has_label.any():
+            return loss_per_label[has_label].mean()
+        return predictions.sum() * 0.0
+
+    raise ValueError(f"unknown loss reduction: {reduction!r}")
 
 
 # --------------------------------------------------------------------------- #
@@ -175,11 +321,31 @@ def evaluate(
 
     metrics: Dict[str, Dict[str, float]] = {}
     if is_main(rank):
-        yp = torch.sigmoid(all_logits).cpu().numpy()
-        yt = all_labels.cpu().numpy()  # contains nan for uncertains
+        if cfg.target_type == "3class":
+            probs_3c = torch.softmax(all_logits.float(), dim=-1)
+            yp = (probs_3c[:, :, 2] - probs_3c[:, :, 0]).cpu().numpy()
+            yt_int = all_labels.cpu().numpy()
+            yt = np.full_like(yp, np.nan)
+            yt[yt_int == 0] = -1.0
+            yt[yt_int == 1] = 0.0
+            yt[yt_int == 2] = 1.0
+        elif cfg.target_type == "raw":
+            yp = torch.clamp(all_logits, -1, 1).cpu().numpy()
+            yt = all_labels.cpu().numpy()
+        else:
+            yp = torch.sigmoid(all_logits).cpu().numpy()
+            yt = all_labels.cpu().numpy()  # contains nan for masked labels
+        # Restrict metrics to the leaderboard-scored labels. In 9-label mode,
+        # this is a no-op (scored == label_names). In 14-label aux mode, this
+        # drops the 5 aux columns so the primary metric reflects leaderboard
+        # scoring only.
+        scored_idx = cfg.scored_indices
+        scored_names = cfg.effective_scored_labels
+        yp_s = yp[:, scored_idx]
+        yt_s = yt[:, scored_idx]
         metrics = {
-            "auroc": per_label_auroc(yt, yp, cfg.label_names),
-            "nmse": per_label_nmse(yt, yp, cfg.label_names),
+            "auroc": per_label_auroc(yt_s, yp_s, scored_names),
+            "nmse": per_label_nmse(yt_s, yp_s, scored_names),
         }
     model.train()
     return metrics
@@ -227,8 +393,20 @@ def main() -> None:
     if cfg.max_val_samples > 0:
         df_val = df_val.head(cfg.max_val_samples).reset_index(drop=True)
         y_val = y_val[: cfg.max_val_samples]
-    train_ds = CheXpertDataset(df_train, y_train, cfg.data_root, build_train_transform(cfg))
-    val_ds = CheXpertDataset(df_val, y_val, cfg.data_root, build_val_transform(cfg))
+    train_ds = CheXpertDataset(
+        df_train, y_train, cfg.data_root, build_train_transform(cfg),
+        clahe=cfg.clahe, clahe_clip_limit=cfg.clahe_clip_limit,
+        clahe_tile_size=cfg.clahe_tile_size,
+        multiview_blend=cfg.multiview_blend,
+        multiview_blend_prob=cfg.multiview_blend_prob,
+        multiview_blend_alpha_min=cfg.multiview_blend_alpha_min,
+        multiview_blend_alpha_max=cfg.multiview_blend_alpha_max,
+    )
+    val_ds = CheXpertDataset(
+        df_val, y_val, cfg.data_root, build_val_transform(cfg),
+        clahe=cfg.clahe, clahe_clip_limit=cfg.clahe_clip_limit,
+        clahe_tile_size=cfg.clahe_tile_size,
+    )
     if is_main(rank):
         print(f"[rank 0] train={len(train_ds):,}  val={len(val_ds):,}", flush=True)
 
@@ -256,16 +434,37 @@ def main() -> None:
     # -------------------- model --------------------
     if is_main(rank):
         print(f"[rank 0] building model …", flush=True)
-    model = CheXpertModel(cfg).to(device)
+    resume_path = ckpt_dir / "ckpt_last.pt"
+    use_pretrained = not resume_path.exists()
+    model = CheXpertModel(cfg, pretrained=use_pretrained).to(device)
     if world_size > 1:
         model = DDP(model, device_ids=[local_rank], find_unused_parameters=False)
 
     inner = model.module if isinstance(model, DDP) else model
-    optimizer = torch.optim.AdamW(
-        inner.param_groups(cfg.lr_backbone, cfg.lr_head, cfg.weight_decay),
-        betas=(0.9, 0.999),
-        eps=1e-8,
-    )
+
+    # EMA (exponential moving average of model weights)
+    ema_model = None
+    if cfg.ema:
+        import copy
+        ema_model = copy.deepcopy(inner).to(device)
+        ema_model.eval()
+        for p in ema_model.parameters():
+            p.requires_grad_(False)
+
+    param_groups = inner.param_groups(cfg.lr_backbone, cfg.lr_head, cfg.weight_decay)
+    if cfg.optimizer == "rmsprop":
+        optimizer = torch.optim.RMSprop(
+            param_groups,
+            momentum=cfg.rmsprop_momentum,
+            alpha=cfg.rmsprop_alpha,
+            eps=1e-8,
+        )
+    else:
+        optimizer = torch.optim.AdamW(
+            param_groups,
+            betas=(0.9, 0.999),
+            eps=1e-8,
+        )
 
     steps_per_epoch = len(train_loader)
     total_steps = steps_per_epoch * cfg.epochs
@@ -297,7 +496,6 @@ def main() -> None:
     best_metric = _worst()
     start_epoch = 0
     skip_in_start_epoch = 0
-    resume_path = ckpt_dir / "ckpt_last.pt"
     if resume_path.exists():
         if is_main(rank):
             print(f"[rank 0] resuming from {resume_path}", flush=True)
@@ -337,6 +535,15 @@ def main() -> None:
     # trigger a host-device sync on every step; we only .item() them
     # at log / eval boundaries. (DDP synchronizes grads on backward(),
     # so grad_norm is identical across ranks.)
+    # Build per-label loss weight tensor
+    if cfg.label_weights:
+        w = [cfg.label_weights.get(n, 1.0) for n in cfg.label_names]
+        _label_weights = torch.tensor(w, device=device, dtype=torch.float32)
+        if is_main(rank):
+            print(f"[rank 0] label_weights: {dict(zip(cfg.label_names, w))}", flush=True)
+    else:
+        _label_weights = None
+
     def fresh_accum() -> dict:
         return {
             "loss_sum": torch.zeros((), device=device),
@@ -371,17 +578,33 @@ def main() -> None:
             y = y.to(device, non_blocking=True)
             local_bs = x.size(0)
 
-            x, y = mixup_batch(x, y, cfg.mixup_alpha)
+            if cfg.target_type != "3class":
+                x, y = mixup_batch(x, y, cfg.mixup_alpha)
 
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
                 logits = model(x)
-                loss = F.binary_cross_entropy_with_logits(logits, y)
+                if cfg.loss_fn == "ce":
+                    loss = masked_3class_ce_loss(logits, y)
+                elif cfg.loss_fn == "mse":
+                    predictions = torch.clamp(logits, -1, 1)
+                    loss = masked_mse_loss(predictions, y, reduction=cfg.loss_reduction,
+                                           label_weights=_label_weights)
+                elif cfg.loss_fn == "smooth_l1":
+                    predictions = torch.clamp(logits, -1, 1)
+                    loss = masked_smooth_l1_loss(predictions, y, reduction=cfg.loss_reduction)
+                else:
+                    loss = masked_bce_with_logits(logits, y, reduction=cfg.loss_reduction)
 
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
             grad_norm = torch.nn.utils.clip_grad_norm_(inner.parameters(), cfg.grad_clip)
             optimizer.step()
             scheduler.step()
+
+            if ema_model is not None:
+                with torch.no_grad():
+                    for p_ema, p_model in zip(ema_model.parameters(), inner.parameters()):
+                        p_ema.lerp_(p_model, 1.0 - cfg.ema_decay)
 
             # Accumulate running stats on-device. No .item() here —
             # that would force a host/device sync every step and
@@ -409,7 +632,8 @@ def main() -> None:
                 )
 
             if global_step % cfg.eval_every_steps == 0 or global_step == total_steps:
-                metrics = evaluate(model, val_loader, device, cfg, world_size, rank)
+                eval_model = ema_model if ema_model is not None else model
+                metrics = evaluate(eval_model, val_loader, device, cfg, world_size, rank)
                 if is_main(rank):
                     # metrics is {"auroc": {...}, "nmse": {...}} on rank 0
                     auroc_metrics = metrics.get("auroc", {})
@@ -455,11 +679,11 @@ def main() -> None:
 
                     per_lab_auroc = "  ".join(
                         f"{n.split()[0][:4]}:{auroc_metrics.get(n, float('nan')):.3f}"
-                        for n in cfg.label_names
+                        for n in cfg.effective_scored_labels
                     )
                     per_lab_nmse = "  ".join(
                         f"{n.split()[0][:4]}:{nmse_metrics.get(n, float('nan')):.3f}"
-                        for n in cfg.label_names
+                        for n in cfg.effective_scored_labels
                     )
                     print(
                         f"[val @ step {global_step}] nmse={mean_nmse:.4f}  auroc={mean_auc:.4f}  "
@@ -470,9 +694,10 @@ def main() -> None:
                     print(f"  auroc: {per_lab_auroc}", flush=True)
                     print(f"  nmse : {per_lab_nmse}", flush=True)
 
-                    save_ckpt(ckpt_dir / "ckpt_last.pt", inner, optimizer, scheduler, global_step, epoch, best_metric, cfg)
+                    save_model = ema_model if ema_model is not None else inner
+                    save_ckpt(ckpt_dir / "ckpt_last.pt", save_model, optimizer, scheduler, global_step, epoch, best_metric, cfg)
                     if is_new_best:
-                        save_ckpt(ckpt_dir / "ckpt_best.pt", inner, optimizer, scheduler, global_step, epoch, best_metric, cfg)
+                        save_ckpt(ckpt_dir / "ckpt_best.pt", save_model, optimizer, scheduler, global_step, epoch, best_metric, cfg)
                         print(
                             f"[val @ step {global_step}] new best {cfg.primary_metric}={best_metric:.4f} — saved ckpt_best.pt",
                             flush=True,
@@ -500,7 +725,7 @@ def main() -> None:
             best_auc = best_per_label.get("auroc", {})
             best_nmse_pl = best_per_label.get("nmse", {})
             print(f"{'label':30s}  {'AUROC':>8s}  {'NMSE':>8s}", flush=True)
-            for name in cfg.label_names:
+            for name in cfg.effective_scored_labels:
                 a = best_auc.get(name, float("nan"))
                 n_ = best_nmse_pl.get(name, float("nan"))
                 a_str = "nan" if not isinstance(a, (int, float)) or math.isnan(a) else f"{a:.4f}"

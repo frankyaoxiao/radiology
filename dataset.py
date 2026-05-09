@@ -3,17 +3,16 @@
 Label conventions (verified against the 2023 CSV, which uses a convention
 that does NOT match the upstream Stanford paper):
 
-    raw csv value   meaning            U-Ones  U-Zeros  U-Ignore
-    -------------   ----------------   ------  -------  --------
-    1.0             positive              1       1        1
-    0.0             UNCERTAIN             1       0      (mask)
-    -1.0            NEGATIVE              0       0        0
-    blank           unmentioned           0       0        0
+    raw csv value   meaning            ones  zeros  ignore
+    -------------   ----------------   ----  -----  ------
+    1.0             positive             1      1      1
+    0.0             UNCERTAIN            1      0    (mask)
+    -1.0            NEGATIVE             0      0      0
+    blank           unmentioned          0      0    (mask, when configured)
 
-Train uses U-Ones by default (uncertain → positive).
-Val preserves the uncertain value as a sentinel (``nan``) so the AUROC
-computation can mask uncertains per-label and compute AUC only over
-clean {0, 1} examples.
+Train uses U-Ones by default (uncertain → positive, blank → negative).
+Score-aligned configs can instead mask uncertain and blank labels with
+``nan``. Val always masks uncertain labels, and optionally masks blanks.
 
 Images are loaded as grayscale JPEGs at native resolution (commonly 2022²),
 duplicated across 3 channels via PIL's ``convert("RGB")``, and fed through
@@ -42,7 +41,7 @@ IMAGENET_STD  = (0.229, 0.224, 0.225)
 # transforms
 # --------------------------------------------------------------------------- #
 def build_train_transform(cfg: Config) -> Callable:
-    return v2.Compose([
+    transforms = [
         v2.ToImage(),
         v2.RandomResizedCrop(
             size=(cfg.image_size, cfg.image_size),
@@ -51,9 +50,14 @@ def build_train_transform(cfg: Config) -> Callable:
         ),
         v2.RandomRotation(degrees=cfg.rotation_deg),
         v2.ColorJitter(brightness=cfg.brightness, contrast=cfg.contrast),
+    ]
+    if cfg.hflip:
+        transforms.append(v2.RandomHorizontalFlip(p=0.5))
+    transforms += [
         v2.ToDtype(torch.float32, scale=True),
         v2.Normalize(mean=IMAGENET_MEAN, std=IMAGENET_STD),
-    ])
+    ]
+    return v2.Compose(transforms)
 
 
 def build_val_transform(cfg: Config) -> Callable:
@@ -87,12 +91,22 @@ def _labels_to_array(
     label_names: List[str],
     *,
     mode: str,
+    uncertain_strategy: dict | None = None,
+    default_uncertain_strategy: str = "ones",
+    blank_strategy: str = "zeros",
 ) -> np.ndarray:
     """Return (N, num_labels) float32 label array.
 
-    mode="u_ones"  : 1→1, 0(unc)→1, -1(neg)→0, blank→0
-    mode="u_zeros" : 1→1, 0(unc)→0, -1(neg)→0, blank→0
-    mode="val"     : 1→1, 0(unc)→nan (mask sentinel), -1(neg)→0, blank→0
+    mode="u_ones"  : 1→1, 0(unc)→1, -1(neg)→0, blank per blank_strategy
+    mode="u_zeros" : 1→1, 0(unc)→0, -1(neg)→0, blank per blank_strategy
+    mode="val"     : 1→1, 0(unc)→nan, -1(neg)→0, blank per blank_strategy
+    mode="per_label": uses uncertain_strategy dict to handle each label differently.
+                      Labels not in the dict default to default_uncertain_strategy.
+                      "ignore" maps uncertain→nan (masked from loss via loss_mask).
+
+    uncertain_strategy: dict mapping label name → "ones"/"zeros"/"ignore".
+    default_uncertain_strategy: fallback for uncertain labels not listed in the dict.
+    blank_strategy: "zeros" for legacy blank-as-negative, "ignore" to mask blanks.
     """
     cols = df[label_names].copy()
     arr = cols.to_numpy(dtype=np.float32)  # blank → NaN
@@ -103,9 +117,22 @@ def _labels_to_array(
     is_neg   = (arr == -1.0)
     is_blank = np.isnan(arr)
 
+    def apply_strategy(out_col: np.ndarray, mask: np.ndarray, strategy: str, label: str) -> None:
+        if strategy == "ones":
+            out_col[mask] = 1.0
+        elif strategy == "zeros":
+            out_col[mask] = 0.0
+        elif strategy == "ignore":
+            out_col[mask] = np.nan
+        else:
+            raise ValueError(f"unknown label strategy for {label}: {strategy!r}")
+
     out = np.zeros_like(arr, dtype=np.float32)
     out[is_pos] = 1.0
-    # is_neg and is_blank → 0 (default)
+    # is_neg and legacy blanks -> 0 (default)
+
+    for i, name in enumerate(label_names):
+        apply_strategy(out[:, i], is_blank[:, i], blank_strategy, f"{name} blank")
 
     if mode == "u_ones":
         out[is_unc] = 1.0
@@ -113,10 +140,46 @@ def _labels_to_array(
         out[is_unc] = 0.0  # already 0
     elif mode == "val":
         out[is_unc] = np.nan  # masked during AUROC
+    elif mode == "per_label":
+        if uncertain_strategy is None:
+            uncertain_strategy = {}
+        for i, name in enumerate(label_names):
+            strategy = uncertain_strategy.get(name, default_uncertain_strategy)
+            apply_strategy(out[:, i], is_unc[:, i], strategy, name)
     else:
         raise ValueError(f"unknown labeling mode: {mode}")
 
     return out.astype(np.float32)
+
+
+def _labels_to_3class_array(
+    df: pd.DataFrame,
+    label_names: List[str],
+) -> np.ndarray:
+    """Return (N, num_labels) int64 class indices. -1=neg->0, 0=unc->1, +1=pos->2, blank->-100 (ignored by CE)."""
+    cols = df[label_names].copy()
+    arr = cols.to_numpy(dtype=np.float32)
+    out = np.full_like(arr, -100, dtype=np.int64)
+    out[arr == -1.0] = 0
+    out[arr == 0.0] = 1
+    out[arr == 1.0] = 2
+    return out
+
+
+def _labels_to_raw_array(
+    df: pd.DataFrame,
+    label_names: List[str],
+    uncertain_mask_labels: List[str] | None = None,
+) -> np.ndarray:
+    """Return (N, num_labels) with raw -1/0/1 values. Blanks -> NaN (masked).
+    If uncertain_mask_labels is set, uncertain (0) values for those labels -> NaN."""
+    cols = df[label_names].copy()
+    arr = cols.to_numpy(dtype=np.float32).copy()  # .copy() makes it writable
+    if uncertain_mask_labels:
+        for i, name in enumerate(label_names):
+            if name in uncertain_mask_labels:
+                arr[arr[:, i] == 0.0, i] = np.nan
+    return arr
 
 
 def load_and_split(
@@ -149,8 +212,36 @@ def load_and_split(
     df_val = df[in_val].reset_index(drop=True)
     df_train = df[~in_val].reset_index(drop=True)
 
-    y_train = _labels_to_array(df_train, cfg.label_names, mode="u_ones")
-    y_val = _labels_to_array(df_val, cfg.label_names, mode="val")
+    if cfg.target_type == "3class":
+        y_train = _labels_to_3class_array(df_train, cfg.label_names)
+        y_val = _labels_to_3class_array(df_val, cfg.label_names)
+        return df_train, df_val, y_train, y_val
+    elif cfg.target_type == "raw":
+        y_train = _labels_to_raw_array(df_train, cfg.label_names,
+                                        uncertain_mask_labels=cfg.raw_uncertain_mask)
+        y_val = _labels_to_raw_array(df_val, cfg.label_names,
+                                      uncertain_mask_labels=cfg.raw_uncertain_mask)
+    else:
+        custom_train_labels = (
+            cfg.uncertain_strategy
+            or cfg.default_uncertain_strategy != "ones"
+            or cfg.blank_strategy != "zeros"
+        )
+        if custom_train_labels:
+            y_train = _labels_to_array(
+                df_train, cfg.label_names,
+                mode="per_label",
+                uncertain_strategy=cfg.uncertain_strategy,
+                default_uncertain_strategy=cfg.default_uncertain_strategy,
+                blank_strategy=cfg.blank_strategy,
+            )
+        else:
+            y_train = _labels_to_array(df_train, cfg.label_names, mode="u_ones")
+        y_val = _labels_to_array(
+            df_val, cfg.label_names,
+            mode="val",
+            blank_strategy=cfg.blank_strategy,
+        )
     return df_train, df_val, y_train, y_val
 
 
@@ -164,20 +255,77 @@ class CheXpertDataset(Dataset):
         y: np.ndarray,
         data_root: str | Path,
         transform: Callable,
+        clahe: bool = False,
+        clahe_clip_limit: float = 2.0,
+        clahe_tile_size: int = 8,
+        multiview_blend: bool = False,
+        multiview_blend_prob: float = 0.3,
+        multiview_blend_alpha_min: float = 0.3,
+        multiview_blend_alpha_max: float = 0.7,
     ) -> None:
         assert len(df) == len(y), f"{len(df)} rows vs {len(y)} labels"
         self.paths: List[str] = df["Path"].tolist()
-        self.y = y.astype(np.float32)
+        self.y = y
         self.data_root = Path(data_root)
         self.transform = transform
+        self.clahe = clahe
+        if clahe:
+            import cv2
+            self._clahe = cv2.createCLAHE(
+                clipLimit=clahe_clip_limit,
+                tileGridSize=(clahe_tile_size, clahe_tile_size),
+            )
+        self.multiview_blend = multiview_blend
+        self.multiview_blend_prob = multiview_blend_prob
+        self.multiview_blend_alpha_min = multiview_blend_alpha_min
+        self.multiview_blend_alpha_max = multiview_blend_alpha_max
+        if multiview_blend:
+            import re
+            self._study_to_indices: dict[str, List[int]] = {}
+            for i, p in enumerate(self.paths):
+                m = re.search(r"(pid\d+/study\d+)", p)
+                if m:
+                    study = m.group(1)
+                    self._study_to_indices.setdefault(study, []).append(i)
+            n_multi = sum(1 for v in self._study_to_indices.values() if len(v) > 1)
+            print(f"[multiview_blend] {n_multi} studies with 2+ views", flush=True)
 
     def __len__(self) -> int:
         return len(self.paths)
 
-    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
+    def _apply_clahe(self, img: Image.Image) -> Image.Image:
+        """Apply CLAHE to a PIL image: convert to grayscale, equalize, back to RGB."""
+        gray = np.array(img.convert("L"))
+        equalized = self._clahe.apply(gray)
+        return Image.fromarray(equalized).convert("RGB")
+
+    def _load_and_transform(self, idx: int) -> torch.Tensor:
         full = self.data_root / self.paths[idx]
         with Image.open(full) as img:
-            img = img.convert("RGB")  # grayscale → 3-channel
-            x = self.transform(img)
-        y = torch.from_numpy(self.y[idx])
+            if self.clahe:
+                img = self._apply_clahe(img)
+            else:
+                img = img.convert("RGB")
+            return self.transform(img)
+
+    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
+        x = self._load_and_transform(idx)
+        y = torch.from_numpy(np.array(self.y[idx]))
+
+        if self.multiview_blend and np.random.random() < self.multiview_blend_prob:
+            import re
+            m = re.search(r"(pid\d+/study\d+)", self.paths[idx])
+            if m:
+                study = m.group(1)
+                partners = self._study_to_indices.get(study, [])
+                others = [i for i in partners if i != idx]
+                if others:
+                    other_idx = others[np.random.randint(len(others))]
+                    x2 = self._load_and_transform(other_idx)
+                    alpha = np.random.uniform(
+                        self.multiview_blend_alpha_min,
+                        self.multiview_blend_alpha_max,
+                    )
+                    x = alpha * x + (1 - alpha) * x2
+
         return x, y
