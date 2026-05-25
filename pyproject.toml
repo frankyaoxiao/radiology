@@ -17,6 +17,8 @@ dependencies = [
     "timm>=1.0",
     "safetensors>=0.4",
     "opencv-python>=4.8",
+    "torchxrayvision>=1.4.0",
+    "open-clip-torch>=3.3.0",
 ]
 
 # The cluster's NVIDIA driver is 12.8 (12080); torch built against CUDA

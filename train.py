@@ -58,15 +58,15 @@ def _validate_config(cfg: Config) -> None:
         p = Path(getattr(cfg, attr))
         if not p.exists():
             raise FileNotFoundError(f"cfg.{attr}={p} does not exist")
-    if cfg.model_type == "dinov3" and cfg.head_type not in ("cls", "attention"):
-        raise ValueError(f"cfg.head_type must be 'cls' or 'attention', got {cfg.head_type!r}")
-    valid_models = ("dinov3", "densenet121", "convnext_base", "convnext_small", "rad_dino")
+    if cfg.model_type == "dinov3" and cfg.head_type not in ("cls", "attention", "mlp"):
+        raise ValueError(f"cfg.head_type must be 'cls', 'attention', or 'mlp', got {cfg.head_type!r}")
+    valid_models = ("dinov3", "densenet121", "convnext_base", "convnext_small", "rad_dino", "radio_dino", "xrv_densenet121", "siglip2", "eva02", "openclip", "biomedclip")
     if cfg.model_type not in valid_models:
         raise ValueError(f"cfg.model_type must be one of {valid_models}, got {cfg.model_type!r}")
-    if cfg.target_type not in ("binary", "raw", "3class"):
-        raise ValueError(f"cfg.target_type must be 'binary', 'raw', or '3class', got {cfg.target_type!r}")
-    if cfg.loss_fn not in ("bce", "mse", "smooth_l1", "ce"):
-        raise ValueError(f"cfg.loss_fn must be 'bce', 'mse', 'smooth_l1', or 'ce', got {cfg.loss_fn!r}")
+    if cfg.target_type not in ("binary", "raw", "3class", "coral"):
+        raise ValueError(f"cfg.target_type must be 'binary', 'raw', '3class', or 'coral', got {cfg.target_type!r}")
+    if cfg.loss_fn not in ("bce", "mse", "smooth_l1", "ce", "coral"):
+        raise ValueError(f"cfg.loss_fn must be 'bce', 'mse', 'smooth_l1', 'ce', or 'coral', got {cfg.loss_fn!r}")
     if cfg.num_labels != len(cfg.label_names):
         raise ValueError(f"cfg.num_labels={cfg.num_labels} != len(label_names)={len(cfg.label_names)}")
     valid_label_strategies = {"ones", "zeros", "ignore"}
@@ -233,16 +233,152 @@ def masked_mse_loss(
 def masked_3class_ce_loss(
     logits_3c: torch.Tensor,
     targets: torch.Tensor,
+    label_smoothing: float = 0.0,
+    focal_gamma: float = 0.0,
 ) -> torch.Tensor:
-    """Per-label cross-entropy for 3-class targets. logits_3c: (B, L, 3), targets: (B, L) int64, -100=ignored."""
+    """Per-label cross-entropy for 3-class targets. logits_3c: (B, L, 3), targets: (B, L) int64, -100=ignored.
+
+    When focal_gamma > 0, applies focal modulation: per-sample loss *= (1 - p_true)^gamma.
+    """
     B, L, C = logits_3c.shape
-    loss = F.cross_entropy(
-        logits_3c.reshape(B * L, C),
-        targets.reshape(B * L),
-        ignore_index=-100,
-        reduction="mean",
+    flat_logits = logits_3c.reshape(B * L, C)
+    flat_targets = targets.reshape(B * L)
+
+    if focal_gamma <= 0:
+        return F.cross_entropy(
+            flat_logits, flat_targets,
+            ignore_index=-100, reduction="mean",
+            label_smoothing=label_smoothing,
+        )
+
+    # Focal path: per-sample CE, then modulate by (1 - p_true)^gamma. Mask -100 manually.
+    valid = (flat_targets != -100)
+    if valid.sum() == 0:
+        return flat_logits.sum() * 0.0
+    safe_targets = flat_targets.clamp(min=0)
+    per_sample = F.cross_entropy(
+        flat_logits, safe_targets,
+        reduction="none",
+        label_smoothing=label_smoothing,
     )
-    return loss
+    log_probs = F.log_softmax(flat_logits, dim=-1)
+    p_true = log_probs.gather(1, safe_targets.unsqueeze(1)).exp().squeeze(1)
+    focal_weight = (1.0 - p_true).clamp(min=0).pow(focal_gamma)
+    per_sample = per_sample * focal_weight
+    per_sample = per_sample * valid.float()
+    return per_sample.sum() / valid.sum().clamp(min=1)
+
+
+def masked_coral_loss(
+    logits_2c: torch.Tensor,
+    targets: torch.Tensor,
+    label_weights: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """CORAL ordinal regression loss.
+
+    logits_2c: (B, L, 2) — two cumulative threshold logits per label.
+      logit[..., 0] predicts P(Y > -1) (i.e., not strongly negative).
+      logit[..., 1] predicts P(Y > 0) (i.e., positive).
+    targets: (B, L) int64 in {0, 1, 2, -100}. Class 0=-1, 1=0, 2=+1, -100=ignored.
+
+    Per-(sample, label) loss = BCE on each of the 2 cumulative thresholds.
+    """
+    B, L, _ = logits_2c.shape
+    # Cumulative targets per threshold:
+    #   threshold 0 (Y > -1): target = 1 if class >= 1 else 0
+    #   threshold 1 (Y > 0): target = 1 if class >= 2 else 0
+    valid = (targets != -100)
+    safe = targets.clamp(min=0)
+    t0 = (safe >= 1).float()
+    t1 = (safe >= 2).float()
+    cum = torch.stack([t0, t1], dim=-1)  # (B, L, 2)
+    per_elem = F.binary_cross_entropy_with_logits(logits_2c, cum, reduction="none")  # (B, L, 2)
+    per_label = per_elem.mean(dim=-1)  # (B, L) avg over 2 thresholds
+    per_label = per_label * valid.float()
+    if label_weights is not None:
+        per_label = per_label * label_weights.unsqueeze(0)
+    return per_label.sum() / valid.sum().clamp(min=1)
+
+
+def masked_3class_aux_mse(
+    logits_3c: torch.Tensor,
+    raw_targets_int: torch.Tensor,
+) -> torch.Tensor:
+    """MSE between (P(+1) - P(-1)) and raw target {-1, 0, +1}, with -100 (blank) masked.
+
+    Used as an auxiliary signal alongside 3-class CE so the model is also pushed toward
+    the leaderboard's NMSE objective directly.
+    """
+    # Map integer class indices {0, 1, 2} → raw values {-1, 0, +1}; -100 stays for masking.
+    valid = (raw_targets_int != -100)
+    raw = torch.where(
+        raw_targets_int == 0, torch.full_like(raw_targets_int, -1, dtype=torch.float32),
+        torch.where(raw_targets_int == 1, torch.zeros_like(raw_targets_int, dtype=torch.float32),
+                    torch.ones_like(raw_targets_int, dtype=torch.float32))
+    )
+    probs = F.softmax(logits_3c.float(), dim=-1)
+    pred_value = probs[..., 2] - probs[..., 0]
+    se = (pred_value - raw) ** 2
+    se = se * valid.float()
+    return se.sum() / valid.sum().clamp(min=1)
+
+
+def mixup_3class_batch(
+    x: torch.Tensor,
+    y: torch.Tensor,
+    alpha: float,
+    *,
+    label_smoothing: float = 0.0,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Mixup-with-soft-targets for 3-class CE.
+
+    Returns (x_mix, soft_y_mix, valid_mask).
+      - x_mix:        (B, C, H, W) blended images (or original if alpha<=0)
+      - soft_y_mix:   (B, L, 3)    blended one-hot (or smoothed) targets
+      - valid_mask:   (B, L)       True where BOTH samples in the pair had a non-blank label
+                                   (when alpha<=0 the mask is just where y != -100).
+
+    Label smoothing is applied to the per-sample one-hots before blending so
+    the smoothing is preserved through the mixup interpolation.
+    """
+    # Build smoothed one-hot from integer targets, with -100 → all zeros + invalid mask.
+    valid = (y != -100)                                          # (B, L)
+    y_safe = y.clamp(min=0)                                      # blanks become class 0; mask hides them
+    one_hot = F.one_hot(y_safe, num_classes=3).float()           # (B, L, 3)
+    if label_smoothing > 0:
+        # Smoothed: true class = 1 - eps + eps/C; others = eps/C  (this matches PyTorch's CE smoothing)
+        eps = float(label_smoothing)
+        one_hot = one_hot * (1.0 - eps) + (eps / 3.0)
+    # Zero out invalid rows so they don't contribute when blended
+    one_hot = one_hot * valid.unsqueeze(-1).float()
+
+    if alpha <= 0:
+        return x, one_hot, valid
+
+    lam = float(np.random.beta(alpha, alpha))
+    perm = torch.randperm(x.size(0), device=x.device)
+
+    x_mix = lam * x + (1.0 - lam) * x[perm]
+    soft_mix = lam * one_hot + (1.0 - lam) * one_hot[perm]
+    valid_mix = valid & valid[perm]                              # both partners must be non-blank
+    soft_mix = soft_mix * valid_mix.unsqueeze(-1).float()
+
+    return x_mix, soft_mix, valid_mix
+
+
+def soft_3class_ce_loss(
+    logits_3c: torch.Tensor,
+    soft_targets: torch.Tensor,
+    valid_mask: torch.Tensor,
+) -> torch.Tensor:
+    """Soft-target CE: -sum(p * log_softmax(z)) reduced over valid (sample, label) pairs.
+
+    logits_3c: (B, L, 3), soft_targets: (B, L, 3), valid_mask: (B, L) bool.
+    """
+    log_probs = F.log_softmax(logits_3c, dim=-1)                 # (B, L, 3)
+    per_label = -(soft_targets * log_probs).sum(dim=-1)          # (B, L)
+    per_label = per_label * valid_mask.float()
+    return per_label.sum() / valid_mask.sum().clamp(min=1)
 
 
 def masked_smooth_l1_loss(
@@ -329,6 +465,15 @@ def evaluate(
             yt[yt_int == 0] = -1.0
             yt[yt_int == 1] = 0.0
             yt[yt_int == 2] = 1.0
+        elif cfg.target_type == "coral":
+            # logits (B, L, 2); scalar = sigmoid(logit_0) + sigmoid(logit_1) - 1 ∈ [-1, 1]
+            probs = torch.sigmoid(all_logits.float())
+            yp = (probs[:, :, 0] + probs[:, :, 1] - 1.0).cpu().numpy()
+            yt_int = all_labels.cpu().numpy()
+            yt = np.full_like(yp, np.nan)
+            yt[yt_int == 0] = -1.0
+            yt[yt_int == 1] = 0.0
+            yt[yt_int == 2] = 1.0
         elif cfg.target_type == "raw":
             yp = torch.clamp(all_logits, -1, 1).cpu().numpy()
             yt = all_labels.cpu().numpy()
@@ -401,11 +546,13 @@ def main() -> None:
         multiview_blend_prob=cfg.multiview_blend_prob,
         multiview_blend_alpha_min=cfg.multiview_blend_alpha_min,
         multiview_blend_alpha_max=cfg.multiview_blend_alpha_max,
+        lung_crop_csv=getattr(cfg, "lung_crop_csv", ""),
     )
     val_ds = CheXpertDataset(
         df_val, y_val, cfg.data_root, build_val_transform(cfg),
         clahe=cfg.clahe, clahe_clip_limit=cfg.clahe_clip_limit,
         clahe_tile_size=cfg.clahe_tile_size,
+        lung_crop_csv=getattr(cfg, "lung_crop_csv", ""),
     )
     if is_main(rank):
         print(f"[rank 0] train={len(train_ds):,}  val={len(val_ds):,}", flush=True)
@@ -437,6 +584,18 @@ def main() -> None:
     resume_path = ckpt_dir / "ckpt_last.pt"
     use_pretrained = not resume_path.exists()
     model = CheXpertModel(cfg, pretrained=use_pretrained).to(device)
+    # Optional warm-start from external ckpt (model weights only, no optimizer
+    # state). Skipped if resume_path exists (resume from same-run ckpt takes
+    # precedence). cfg.init_from_ckpt should point to a ckpt produced by a
+    # prior training stage.
+    if not resume_path.exists() and getattr(cfg, "init_from_ckpt", ""):
+        init_path = Path(cfg.init_from_ckpt).expanduser()
+        if is_main(rank):
+            print(f"[rank 0] warm-start from {init_path} (model weights only)", flush=True)
+        ck = torch.load(str(init_path), map_location="cpu", weights_only=False)
+        missing, unexpected = model.load_state_dict(ck["model"], strict=False)
+        if is_main(rank):
+            print(f"[rank 0] warm-start: missing={len(missing)} unexpected={len(unexpected)}", flush=True)
     if world_size > 1:
         model = DDP(model, device_ids=[local_rank], find_unused_parameters=False)
 
@@ -459,6 +618,26 @@ def main() -> None:
             alpha=cfg.rmsprop_alpha,
             eps=1e-8,
         )
+    elif cfg.optimizer == "muon":
+        from muon import Muon, CompositeOptimizer
+        muon_groups = [g for g in param_groups if g.get("name") == "backbone_decay"]
+        adamw_groups = [g for g in param_groups if g.get("name") != "backbone_decay"]
+        if is_main(rank):
+            n_muon = sum(p.numel() for g in muon_groups for p in g["params"])
+            n_adamw = sum(p.numel() for g in adamw_groups for p in g["params"])
+            print(f"[muon] backbone-2D params (Muon): {n_muon/1e6:.1f}M  "
+                  f"other params (AdamW): {n_adamw/1e6:.2f}M", flush=True)
+        muon_opt = Muon(
+            muon_groups,
+            momentum=cfg.muon_momentum,
+            ns_steps=cfg.muon_ns_steps,
+        )
+        adamw_opt = torch.optim.AdamW(
+            adamw_groups,
+            betas=(0.9, 0.999),
+            eps=1e-8,
+        )
+        optimizer = CompositeOptimizer([muon_opt, adamw_opt])
     else:
         optimizer = torch.optim.AdamW(
             param_groups,
@@ -578,13 +757,40 @@ def main() -> None:
             y = y.to(device, non_blocking=True)
             local_bs = x.size(0)
 
+            # Mixup branching by target type:
+            #   - For binary/raw, the existing mixup_batch handles float labels (NaN-aware blending).
+            #   - For 3-class CE, we need soft-target mixup (one-hot + lerp + soft CE).
+            #     If mixup_alpha is 0 we still apply label smoothing through the soft path
+            #     when label_smoothing > 0, otherwise fall through to the integer-target CE
+            #     path (cheapest).
+            soft_3class_path = (
+                cfg.target_type == "3class"
+                and cfg.loss_fn == "ce"
+                and cfg.mixup_alpha > 0
+            )
             if cfg.target_type != "3class":
                 x, y = mixup_batch(x, y, cfg.mixup_alpha)
+            elif soft_3class_path:
+                x, soft_y, valid_mask = mixup_3class_batch(
+                    x, y, cfg.mixup_alpha, label_smoothing=cfg.label_smoothing,
+                )
 
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
                 logits = model(x)
                 if cfg.loss_fn == "ce":
-                    loss = masked_3class_ce_loss(logits, y)
+                    if soft_3class_path:
+                        loss = soft_3class_ce_loss(logits, soft_y, valid_mask)
+                    else:
+                        loss = masked_3class_ce_loss(
+                            logits, y,
+                            label_smoothing=cfg.label_smoothing,
+                            focal_gamma=cfg.focal_gamma,
+                        )
+                    if cfg.aux_mse_weight > 0:
+                        aux = masked_3class_aux_mse(logits, y)
+                        loss = (1.0 - cfg.aux_mse_weight) * loss + cfg.aux_mse_weight * aux
+                elif cfg.loss_fn == "coral":
+                    loss = masked_coral_loss(logits, y, label_weights=_label_weights)
                 elif cfg.loss_fn == "mse":
                     predictions = torch.clamp(logits, -1, 1)
                     loss = masked_mse_loss(predictions, y, reduction=cfg.loss_reduction,

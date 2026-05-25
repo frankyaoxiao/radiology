@@ -1,0 +1,51 @@
+# DINOv3 ViT-H+/16 + 3-class CE + head_dropout=0.3 — seed 1.
+# Identical to v1_3class_hplus_s0.yaml except seed.
+
+run_name: v1_3class_hplus_s1
+runs_root: /data/artifacts/frank/misc/runs
+
+# data
+data_root: /data/artifacts/frank/misc
+labels_csv: /data/artifacts/frank/misc/labels/train2023.csv
+test_ids_csv: /data/artifacts/frank/misc/labels/test_ids.csv
+val_frac: 0.1
+split_seed: 42
+
+# image
+image_size: 768
+crop_scale_min: 0.9
+crop_scale_max: 1.0
+rotation_deg: 10.0
+brightness: 0.2
+contrast: 0.2
+
+# model
+model_type: dinov3
+dinov3_repo: /data/artifacts/frank/misc/dinov3_repo
+dinov3_arch: dinov3_vith16plus
+dinov3_weights: /data/artifacts/frank/misc/labels/dino/dinov3_hplus.pth
+head_type: cls
+head_dropout: 0.3
+
+# loss / target
+target_type: 3class
+loss_fn: ce
+
+# optimization (3-class CE recipe; bs=8/GPU × 4 GPUs = effective 32)
+epochs: 8
+batch_size_per_gpu: 8
+num_workers: 8
+lr_head: 1.0e-3
+lr_backbone: 1.0e-6
+weight_decay: 1.0e-4
+warmup_ratio: 0.05
+grad_clip: 1.0
+mixup_alpha: 0.0
+
+# eval / ckpt
+eval_every_steps: 2000
+primary_metric: nmse
+
+# misc
+seed: 1
+log_every_steps: 20

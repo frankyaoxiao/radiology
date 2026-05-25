@@ -90,11 +90,24 @@ class Config:
     # --- model ---
     # model_type: "dinov3" (original ViT-H+) or "densenet121" (torchvision).
     model_type: str = "dinov3"
-    # DenseNet-121 / ConvNeXt settings
+    # DenseNet-121 / ConvNeXt / RAD-DINO / Radio-DINO head dropout
     dropout: float = 0.5
+    # Optional dropout in the DINOv3 ClsHead path (default 0 preserves existing
+    # behavior; set to 0.3 to match RAD-DINO's recipe in the DINOv3 path).
+    head_dropout: float = 0.0
     convnext_weights: str = ""
     # RAD-DINO (microsoft/rad-dino): HuggingFace model ID or local path.
     rad_dino_path: str = "microsoft/rad-dino"
+    # XRV DenseNet121 pre-extracted features-only state_dict path (only used by
+    # model_type="xrv_densenet121"). We avoid importing torchxrayvision at train
+    # time because its submodule collides with our top-level model.py.
+    # Pre-saved options (all legal, no CheXpert in pretraining):
+    #   xrv_densenet121_mimic_ch_features.pt  (MIMIC-CXR — recommended)
+    #   xrv_densenet121_mimic_nb_features.pt  (MIMIC-CXR, negative-binding variant)
+    #   xrv_densenet121_nih_features.pt        (NIH only)
+    xrv_weights_path: str = "/data/artifacts/frank/misc/xrv_densenet121_mimic_ch_features.pt"
+    # SigLIP 2 variant: "patch14_384" or "naflex_512"
+    siglip2_variant: str = "patch14_384"
     # Which hidden layer to use for patch tokens in attention pooling.
     # -1 = last layer, -2 = second-to-last, etc. Only used with head_type="attention".
     rad_dino_layer: int = -2
@@ -104,10 +117,12 @@ class Config:
     dinov3_repo: str = "/data/artifacts/frank/misc/dinov3_repo"
     dinov3_arch: str = "dinov3_vith16plus"
     dinov3_weights: str = "/data/artifacts/frank/misc/labels/dino/dinov3_hplus.pth"
-    # Head type: "attention" (attention pooling over CLS + storage + patches)
-    # or "cls" (linear on CLS token only).
+    # Head type: "attention" (attention pooling over CLS + storage + patches),
+    # "cls" (linear on CLS token only), or "mlp" (2-layer MLP on CLS token).
     head_type: str = "cls"
     attn_pool_heads: int = 8
+    # Hidden dimension for the MLP head (only used when head_type == "mlp").
+    head_hidden_dim: int = 512
 
     # --- optimization ---
     epochs: int = 5
@@ -124,6 +139,23 @@ class Config:
     # then averages labels equally; useful when blanks are masked and label
     # density differs by orders of magnitude.
     loss_reduction: str = "micro"
+    # Label smoothing for 3-class CE (and the soft-target mixup path).
+    # 0.0 = no smoothing (default); 0.1 = standard; 0.2 = aggressive.
+    label_smoothing: float = 0.0
+    # Focal loss exponent for 3-class CE. 0 = standard CE; 1-3 = focal modulation.
+    # focal_gamma > 0: per-sample loss is multiplied by (1 - p_true_class)^gamma.
+    focal_gamma: float = 0.0
+    # Auxiliary MSE loss weight on (P(+1) - P(-1)) vs raw targets, alongside 3-class CE.
+    # 0.0 = pure CE (default). Total = (1 - aux_mse_weight) * CE + aux_mse_weight * MSE.
+    aux_mse_weight: float = 0.0
+    # Augmentation pipeline: "basic" (default crop+rotate+colorjitter), "randaug_light",
+    # "randaug_std", "randaug_strong", or "trivial" (TrivialAugmentWide).
+    augmentation: str = "basic"
+    # Optional pseudo-label CSV merged into the train set during training.
+    # Path schema is the same as labels_csv (with Path + 9 label columns).
+    # data_root for these images comes from data_root unless pseudo_label_data_root is set.
+    pseudo_label_csv: str = ""
+    pseudo_label_data_root: str = ""
     # "binary": train targets are 0/1, loss is BCE, submit sigmoid probs.
     # "raw": train targets are -1/0/1, loss is MSE, submit clipped linear outputs.
     # "3class": train targets are class indices {0=-1, 1=0, 2=+1}, loss is per-label CE,
@@ -139,13 +171,49 @@ class Config:
     # uncertain dominates and raw MSE learns "predict 0" instead of
     # useful pos/neg separation.
     raw_uncertain_mask: Optional[List[str]] = None
-    # Optimizer: "adamw" (default) or "rmsprop"
+    # Optimizer: "adamw" (default), "rmsprop", or "muon"
+    # Muon uses orthogonalized momentum for 2D backbone weights; non-2D
+    # params (biases, layernorms, embeddings, head) go to AdamW.
     optimizer: str = "adamw"
     rmsprop_momentum: float = 0.9
     rmsprop_alpha: float = 0.99
+    muon_momentum: float = 0.95
+    muon_ns_steps: int = 5
     # EMA (exponential moving average of weights)
     ema: bool = False
     ema_decay: float = 0.999
+    # Layer-wise LR decay (LLRD). If > 0 and < 1, applies per-block decay so
+    # early layers get a smaller LR than later layers. Standard fine-tuning
+    # trick for large pretrained models (ViTs especially). lr_backbone is the
+    # LR for the LAST backbone block; earlier blocks get lr_backbone * decay^k.
+    # 0.0 (default) disables.
+    llrd_decay: float = 0.0
+
+    # Stochastic depth (drop_path) for ViT-style backbones. timm models
+    # (EVA-02, SigLIP-2, OpenCLIP, ConvNeXt) accept drop_path_rate at construction.
+    # 0.0 (default) disables. Typical values: 0.1 for ViT-L, 0.2 for ViT-H.
+    drop_path_rate: float = 0.0
+
+    # Optional warm-start: load model weights ONLY from this ckpt at init
+    # (NOT optimizer/scheduler/step). Used for two-stage training:
+    # stage 1 trains on external data (e.g., NIH), stage 2 inits from stage 1
+    # and trains on CheXpert from scratch (fresh LR schedule).
+    init_from_ckpt: str = ""
+
+    # Lung-crop: path to a CSV (Path, x0, y0, x1, y1) of per-image lung bounding
+    # boxes. If set, images are cropped to the lung region before augmentation.
+    # Used to train a pulmonary-label specialist on lung-focused crops.
+    lung_crop_csv: str = ""
+
+    # Multi-view fusion: head architecture for combining frontal + lateral features.
+    # "mlp" (default): LayerNorm -> Linear(2D, D) -> GELU -> Dropout -> Linear(D, out)
+    # "linear":        Dropout -> Linear(2D, out)
+    # "sum_linear":    sum features -> Dropout -> Linear(D, out)
+    mv_head_kind: str = "mlp"
+
+    # If true, multi-view training filters to only paired (frontal+lateral) studies
+    # (~17% of training data). Forces the model to learn cross-view fusion.
+    mv_paired_only: bool = False
 
     # --- eval / ckpt ---
     eval_every_steps: int = 500

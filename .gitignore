@@ -5,7 +5,6 @@ build/
 dist/
 wheels/
 *.egg-info
-slurm/
 
 # Virtual environments
 .venv
@@ -17,7 +16,15 @@ runs/
 *.pt
 *.ckpt
 
-# SLURM output
+# Prediction CSVs + downloaded backbone weights — large, regenerable, live outside git
+submissions/
+cxr_model/
+*.log
+
+# Claude Code local runtime state
+.claude/
+
+# SLURM output (but NOT the slurm/ launch scripts — those are committed)
 slurm_logs/
 *.out
 *.err

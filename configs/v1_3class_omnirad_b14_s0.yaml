@@ -1,0 +1,57 @@
+# OmniRad-base (modified DINOv2 + RadImageNet, ViT-B/14) + 3-class CE.
+#
+# Apples-to-apples with v1_3class_b16_s0.yaml (DINOv3 ViT-B/16 @ 512):
+#   - same num tokens per forward (32*32 = 1024 patches)
+#   - same loss/head/optim/data-aug
+# Forced differences:
+#   - patch-14 vs patch-16 (so image_size=448 instead of 512)
+#   - timm load path (OmniRad weights are stored with timm-style keys)
+#   - dropout=0.3 in CLS head (matches RAD-DINO's validated 3-class CE recipe;
+#     DINOv3 ClsHead is bare Linear by historical accident in this codebase)
+
+run_name: v1_3class_omnirad_b14_s0
+runs_root: /data/artifacts/frank/misc/runs
+
+# data
+data_root: /data/artifacts/frank/misc
+labels_csv: /data/artifacts/frank/misc/labels/train2023.csv
+test_ids_csv: /data/artifacts/frank/misc/labels/test_ids.csv
+val_frac: 0.1
+split_seed: 42
+
+# image (448 = 32*14, matches DINOv3-at-512 token count exactly)
+image_size: 448
+crop_scale_min: 0.9
+crop_scale_max: 1.0
+rotation_deg: 10.0
+brightness: 0.2
+contrast: 0.2
+
+# model: OmniRad-base via timm (Snarcy/OmniRad-base)
+model_type: radio_dino
+rad_dino_path: hf_hub:Snarcy/OmniRad-base
+head_type: cls
+dropout: 0.3
+
+# loss / target
+target_type: 3class
+loss_fn: ce
+
+# optimization (identical to v1_3class_b16_s0.yaml)
+epochs: 8
+batch_size_per_gpu: 16
+num_workers: 8
+lr_head: 1.0e-3
+lr_backbone: 1.0e-6
+weight_decay: 1.0e-4
+warmup_ratio: 0.05
+grad_clip: 1.0
+mixup_alpha: 0.0
+
+# eval / ckpt
+eval_every_steps: 2000
+primary_metric: nmse
+
+# misc
+seed: 0
+log_every_steps: 20

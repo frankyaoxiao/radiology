@@ -109,6 +109,7 @@ class SubmitDataset(Dataset):
         clahe: bool = False,
         clahe_clip_limit: float = 2.0,
         clahe_tile_size: int = 8,
+        lung_crop_csv: str = "",
     ) -> None:
         self.ids: List[int] = df["Id"].tolist()
         self.paths: List[str] = df["Path"].tolist()
@@ -121,6 +122,14 @@ class SubmitDataset(Dataset):
                 clipLimit=clahe_clip_limit,
                 tileGridSize=(clahe_tile_size, clahe_tile_size),
             )
+        self.lung_bbox = None
+        if lung_crop_csv:
+            import pandas as pd
+            bdf = pd.read_csv(lung_crop_csv)
+            self.lung_bbox = {
+                row.Path: (int(row.x0), int(row.y0), int(row.x1), int(row.y1))
+                for row in bdf.itertuples(index=False)
+            }
 
     def __len__(self) -> int:
         return len(self.ids)
@@ -134,6 +143,10 @@ class SubmitDataset(Dataset):
 
     def __getitem__(self, idx: int) -> Tuple[int, torch.Tensor]:
         with Image.open(self.root / self.paths[idx]) as img:
+            if self.lung_bbox is not None:
+                bbox = self.lung_bbox.get(self.paths[idx])
+                if bbox is not None and bbox[2] > bbox[0] and bbox[3] > bbox[1]:
+                    img = img.crop(bbox)
             if self.clahe:
                 img = self._apply_clahe(img)
             else:
@@ -211,18 +224,25 @@ def run_inference(
     model: CheXpertModel,
     loader: DataLoader,
     device: torch.device,
+    use_bf16: bool = False,
 ) -> Tuple[List[int], np.ndarray]:
     """Run inference, return (ids, logits) — logits not sigmoided yet.
 
-    Runs in native FP32 (no autocast) for bit-reproducible outputs. Slower,
-    but eliminates a source of run-to-run drift in submission CSVs.
+    Default is native FP32 (no autocast) for bit-reproducible outputs. Slower
+    but eliminates run-to-run drift in submission CSVs. Pass use_bf16=True to
+    run with bfloat16 autocast (matches training precision; ~4× faster on
+    H100 for ViT-H+).
     """
     all_ids: List[int] = []
     all_logits: List[np.ndarray] = []
     with torch.no_grad():
         for ids, x in loader:
             x = x.to(device, non_blocking=True)
-            logits = model(x)
+            if use_bf16:
+                with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                    logits = model(x)
+            else:
+                logits = model(x)
             all_logits.append(logits.float().cpu().numpy())
             all_ids.extend([int(i) for i in ids])
     return all_ids, np.concatenate(all_logits, axis=0)
@@ -249,6 +269,7 @@ def run_inference_tta(
             df, cfg.data_root, tfm,
             clahe=cfg.clahe, clahe_clip_limit=cfg.clahe_clip_limit,
             clahe_tile_size=cfg.clahe_tile_size,
+            lung_crop_csv=getattr(cfg, "lung_crop_csv", ""),
         )
         loader = DataLoader(
             ds, batch_size=batch_size, shuffle=False,
@@ -335,6 +356,9 @@ def main() -> None:
     ap.add_argument("--temp-scale", type=float, nargs="+", default=None,
                     help="temperature(s) for scaling. Single value = global, "
                          "9 values = per-label.")
+    ap.add_argument("--bf16", action="store_true",
+                    help="run inference in bfloat16 autocast (faster, matches "
+                         "training precision; loses strict bit-reproducibility).")
     ap.add_argument("--derive-no-finding", type=float, default=None,
                     help="alpha for blending model No Finding with derived signal. "
                          "0=fully derived, 1=fully model, 0.5=50/50 blend.")
@@ -386,12 +410,13 @@ def main() -> None:
                 df, model_cfg.data_root, build_val_transform(model_cfg),
                 clahe=model_cfg.clahe, clahe_clip_limit=model_cfg.clahe_clip_limit,
                 clahe_tile_size=model_cfg.clahe_tile_size,
+                lung_crop_csv=getattr(model_cfg, "lung_crop_csv", ""),
             )
             loader = DataLoader(
                 ds, batch_size=args.batch_size, shuffle=False,
                 num_workers=args.num_workers, pin_memory=True,
             )
-            all_ids, logits = run_inference(model, loader, device)
+            all_ids, logits = run_inference(model, loader, device, use_bf16=args.bf16)
 
         if ensemble_logits is None:
             ensemble_logits = logits
@@ -428,6 +453,13 @@ def main() -> None:
         probs = probs_3c[:, :, 2] - probs_3c[:, :, 0]
         probs = np.clip(probs, -1, 1)
         print("  3-class mode: P(+1) - P(-1)", flush=True)
+    elif cfg.target_type == "coral":
+        logits_2c = logits.reshape(-1, cfg.num_labels, 2)
+        sig = 1.0 / (1.0 + np.exp(-logits_2c))
+        # scalar = sigmoid(logit_0) + sigmoid(logit_1) - 1 ∈ [-1, 1]
+        probs = sig[:, :, 0] + sig[:, :, 1] - 1.0
+        probs = np.clip(probs, -1, 1)
+        print("  CORAL ordinal mode: P(Y>-1) + P(Y>0) - 1", flush=True)
     elif cfg.target_type == "raw":
         probs = np.clip(logits, -1, 1)
         print("  raw target mode: clipping logits to [-1, 1]", flush=True)

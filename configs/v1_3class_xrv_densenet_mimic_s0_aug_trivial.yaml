@@ -1,0 +1,47 @@
+run_name: v1_3class_xrv_densenet_mimic_s0_aug_trivial
+runs_root: /data/artifacts/frank/misc/runs
+
+# data
+data_root: /data/artifacts/frank/misc
+labels_csv: /data/artifacts/frank/misc/labels/train2023.csv
+test_ids_csv: /data/artifacts/frank/misc/labels/test_ids.csv
+val_frac: 0.1
+split_seed: 42
+
+# image — 448 resolution, same crop/aug spec as other backbones
+image_size: 448
+crop_scale_min: 0.9
+crop_scale_max: 1.0
+rotation_deg: 10.0
+brightness: 0.2
+contrast: 0.2
+
+# model
+model_type: xrv_densenet121
+xrv_weights_path: /data/artifacts/frank/misc/xrv_densenet121_mimic_ch_features.pt
+head_type: cls
+dropout: 0.3
+
+# loss / target
+target_type: 3class
+loss_fn: ce
+
+# optimization (single-GPU, batch 16 — DenseNet121 is small)
+epochs: 8
+batch_size_per_gpu: 16
+num_workers: 8
+lr_head: 1.0e-3
+lr_backbone: 1.0e-5     # higher than ViT recipe because DenseNet is smaller & shallower
+weight_decay: 1.0e-4
+warmup_ratio: 0.05
+grad_clip: 1.0
+mixup_alpha: 0.0
+
+# eval / ckpt
+eval_every_steps: 2000
+primary_metric: nmse
+
+seed: 0
+log_every_steps: 20
+
+augmentation: trivial

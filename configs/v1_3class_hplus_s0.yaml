@@ -1,0 +1,60 @@
+# DINOv3 ViT-H+/16 (840M) + 3-class CE head + head_dropout=0.3.
+#
+# The "untried legal moonshot" — the original 1.18 baseline used this backbone
+# with the wrong loss (BCE on binary targets). With 3-class CE on raw -1/0/1
+# (the validated recipe that won at val 0.662 for ViT-B), this is the first
+# time the ViT-H+ has been trained with the corrected pipeline.
+#
+# Identical hyperparams to v1_3class_b16_s0_drop.yaml except:
+#   - dinov3_arch + weights (ViT-H+ vs ViT-B)
+#   - image_size 768 (matches original v1 baseline; ViT-H+ pretrained at 768)
+#   - batch_size_per_gpu 8 (bs=16 OOMs at 768² on ViT-H+, per v1.yaml note)
+
+run_name: v1_3class_hplus_s0
+runs_root: /data/artifacts/frank/misc/runs
+
+# data
+data_root: /data/artifacts/frank/misc
+labels_csv: /data/artifacts/frank/misc/labels/train2023.csv
+test_ids_csv: /data/artifacts/frank/misc/labels/test_ids.csv
+val_frac: 0.1
+split_seed: 42
+
+# image
+image_size: 768
+crop_scale_min: 0.9
+crop_scale_max: 1.0
+rotation_deg: 10.0
+brightness: 0.2
+contrast: 0.2
+
+# model: DINOv3 ViT-H+/16, native loader, CLS head with dropout 0.3
+model_type: dinov3
+dinov3_repo: /data/artifacts/frank/misc/dinov3_repo
+dinov3_arch: dinov3_vith16plus
+dinov3_weights: /data/artifacts/frank/misc/labels/dino/dinov3_hplus.pth
+head_type: cls
+head_dropout: 0.3
+
+# loss / target
+target_type: 3class
+loss_fn: ce
+
+# optimization (3-class CE recipe; bs=8/GPU × 4 GPUs = effective 32)
+epochs: 8
+batch_size_per_gpu: 8
+num_workers: 8
+lr_head: 1.0e-3
+lr_backbone: 1.0e-6
+weight_decay: 1.0e-4
+warmup_ratio: 0.05
+grad_clip: 1.0
+mixup_alpha: 0.0
+
+# eval / ckpt
+eval_every_steps: 2000
+primary_metric: nmse
+
+# misc
+seed: 0
+log_every_steps: 20

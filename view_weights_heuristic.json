@@ -1,0 +1,12 @@
+{
+  "_comment": "Per-label (w_F, w_L) view weights based on radiology priors. Used by view_average.py via --weights-json.",
+  "No Finding": [3.0, 1.0],
+  "Enlarged Cardiomediastinum": [5.0, 0.0],
+  "Cardiomegaly": [5.0, 0.0],
+  "Lung Opacity": [3.0, 1.0],
+  "Pneumonia": [2.0, 1.0],
+  "Pleural Effusion": [1.0, 1.0],
+  "Pleural Other": [1.0, 1.0],
+  "Fracture": [3.0, 1.0],
+  "Support Devices": [3.0, 1.0]
+}

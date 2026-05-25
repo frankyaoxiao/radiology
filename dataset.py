@@ -41,16 +41,39 @@ IMAGENET_STD  = (0.229, 0.224, 0.225)
 # transforms
 # --------------------------------------------------------------------------- #
 def build_train_transform(cfg: Config) -> Callable:
-    transforms = [
+    aug = getattr(cfg, "augmentation", "basic")
+    base_resize = [
         v2.ToImage(),
         v2.RandomResizedCrop(
             size=(cfg.image_size, cfg.image_size),
             scale=(cfg.crop_scale_min, cfg.crop_scale_max),
             antialias=True,
         ),
-        v2.RandomRotation(degrees=cfg.rotation_deg),
-        v2.ColorJitter(brightness=cfg.brightness, contrast=cfg.contrast),
     ]
+
+    if aug == "basic":
+        body = [
+            v2.RandomRotation(degrees=cfg.rotation_deg),
+            v2.ColorJitter(brightness=cfg.brightness, contrast=cfg.contrast),
+        ]
+    elif aug.startswith("randaug"):
+        # torchvision v2.RandAugment(num_ops, magnitude). magnitude in [0, 30].
+        if aug == "randaug_light":
+            num_ops, magnitude = 2, 5
+        elif aug == "randaug_std":
+            num_ops, magnitude = 2, 9
+        elif aug == "randaug_strong":
+            num_ops, magnitude = 3, 12
+        else:
+            raise ValueError(f"unknown augmentation: {aug!r}")
+        # RandAugment expects uint8 tensors (PIL-style) — operate before ToDtype scale.
+        body = [v2.RandAugment(num_ops=num_ops, magnitude=magnitude)]
+    elif aug == "trivial":
+        body = [v2.TrivialAugmentWide()]
+    else:
+        raise ValueError(f"unknown augmentation: {aug!r}")
+
+    transforms = base_resize + body
     if cfg.hflip:
         transforms.append(v2.RandomHorizontalFlip(p=0.5))
     transforms += [
@@ -192,7 +215,10 @@ def load_and_split(
     """
     df = pd.read_csv(cfg.labels_csv)
     df = _drop_junk_cols(df)
-    df["pid"] = _extract_pid(df["Path"])
+    # If pid column already in the CSV (external datasets without "pid\d+" in
+    # Path), keep it; otherwise extract from Path.
+    if "pid" not in df.columns:
+        df["pid"] = _extract_pid(df["Path"])
     unparseable = int(df["pid"].isna().sum())
     if unparseable:
         print(f"[dataset] dropping {unparseable} row(s) with unparseable Path")
@@ -212,7 +238,30 @@ def load_and_split(
     df_val = df[in_val].reset_index(drop=True)
     df_train = df[~in_val].reset_index(drop=True)
 
-    if cfg.target_type == "3class":
+    # Optionally merge pseudo-labeled data into the train set (kept val intact).
+    pseudo_csv = getattr(cfg, "pseudo_label_csv", "") or ""
+    if pseudo_csv:
+        df_pseudo = pd.read_csv(pseudo_csv)
+        df_pseudo = _drop_junk_cols(df_pseudo)
+        # If pid column already in the CSV (external datasets without "pid\d+" in Path),
+        # keep it; otherwise extract from Path.
+        if "pid" not in df_pseudo.columns:
+            df_pseudo["pid"] = _extract_pid(df_pseudo["Path"])
+        df_pseudo = df_pseudo[df_pseudo["pid"].notna()].reset_index(drop=True)
+        # Only keep label columns that exist in main df, with sentinel for missing aux columns
+        for col in cfg.label_names:
+            if col not in df_pseudo.columns:
+                df_pseudo[col] = np.nan
+        # Keep just (Path, pid, label cols) so the schema matches df_train
+        keep_cols = ["Path", "pid"] + list(cfg.label_names)
+        df_pseudo = df_pseudo[keep_cols]
+        # Also align df_train to that subset before concat
+        df_train_aligned = df_train[keep_cols]
+        df_train = pd.concat([df_train_aligned, df_pseudo], ignore_index=True)
+        print(f"[dataset] merged {len(df_pseudo)} pseudo-labeled rows into train (total now {len(df_train)})", flush=True)
+
+    if cfg.target_type in ("3class", "coral"):
+        # CORAL uses the same integer encoding as 3-class; loss interprets it as ordinal.
         y_train = _labels_to_3class_array(df_train, cfg.label_names)
         y_val = _labels_to_3class_array(df_val, cfg.label_names)
         return df_train, df_val, y_train, y_val
@@ -262,6 +311,7 @@ class CheXpertDataset(Dataset):
         multiview_blend_prob: float = 0.3,
         multiview_blend_alpha_min: float = 0.3,
         multiview_blend_alpha_max: float = 0.7,
+        lung_crop_csv: str = "",
     ) -> None:
         assert len(df) == len(y), f"{len(df)} rows vs {len(y)} labels"
         self.paths: List[str] = df["Path"].tolist()
@@ -269,6 +319,17 @@ class CheXpertDataset(Dataset):
         self.data_root = Path(data_root)
         self.transform = transform
         self.clahe = clahe
+        # Lung-crop: map Path -> (x0, y0, x1, y1). If set, each image is cropped
+        # to its lung bounding box before the transform pipeline.
+        self.lung_bbox: dict[str, tuple] | None = None
+        if lung_crop_csv:
+            bdf = pd.read_csv(lung_crop_csv)
+            self.lung_bbox = {
+                row.Path: (int(row.x0), int(row.y0), int(row.x1), int(row.y1))
+                for row in bdf.itertuples(index=False)
+            }
+            n_have = sum(1 for p in self.paths if p in self.lung_bbox)
+            print(f"[lung_crop] bbox available for {n_have}/{len(self.paths)} images", flush=True)
         if clahe:
             import cv2
             self._clahe = cv2.createCLAHE(
@@ -302,6 +363,10 @@ class CheXpertDataset(Dataset):
     def _load_and_transform(self, idx: int) -> torch.Tensor:
         full = self.data_root / self.paths[idx]
         with Image.open(full) as img:
+            if self.lung_bbox is not None:
+                bbox = self.lung_bbox.get(self.paths[idx])
+                if bbox is not None and bbox[2] > bbox[0] and bbox[3] > bbox[1]:
+                    img = img.crop(bbox)  # (x0, y0, x1, y1)
             if self.clahe:
                 img = self._apply_clahe(img)
             else:

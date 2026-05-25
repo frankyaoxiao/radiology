@@ -1,0 +1,38 @@
+{
+  "No Finding": [
+    2.0,
+    1.0
+  ],
+  "Enlarged Cardiomediastinum": [
+    3.0,
+    1.0
+  ],
+  "Cardiomegaly": [
+    5.0,
+    1.0
+  ],
+  "Lung Opacity": [
+    5.0,
+    2.0
+  ],
+  "Pneumonia": [
+    3.0,
+    2.0
+  ],
+  "Pleural Effusion": [
+    1.0,
+    1.0
+  ],
+  "Pleural Other": [
+    3.0,
+    2.0
+  ],
+  "Fracture": [
+    3.0,
+    1.0
+  ],
+  "Support Devices": [
+    2.0,
+    1.0
+  ]
+}

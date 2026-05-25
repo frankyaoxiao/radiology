@@ -1,0 +1,53 @@
+# DINOv3 ViT-B/16 (LVD-1689M) + 3-class CE head, split 42, seed 0.
+#
+# Legal SOTA candidate: replaces RAD-DINO with the natural-image-only DINOv3.
+# Validated 3-class CE recipe — same loss/head as the DenseNet 3-class and
+# RAD-DINO runs that won at 0.660. Image size 512 (16-divisible for patch-16).
+
+run_name: v1_3class_b16_s0
+runs_root: /data/artifacts/frank/misc/runs
+
+# data
+data_root: /data/artifacts/frank/misc
+labels_csv: /data/artifacts/frank/misc/labels/train2023.csv
+test_ids_csv: /data/artifacts/frank/misc/labels/test_ids.csv
+val_frac: 0.1
+split_seed: 42
+
+# image
+image_size: 512
+crop_scale_min: 0.9
+crop_scale_max: 1.0
+rotation_deg: 10.0
+brightness: 0.2
+contrast: 0.2
+
+# model: native DINOv3 loader (CheXpertDINOv3Model + ClsHead)
+model_type: dinov3
+dinov3_repo: /data/artifacts/frank/misc/dinov3_repo
+dinov3_arch: dinov3_vitb16
+dinov3_weights: /data/artifacts/frank/misc/labels/dino/dinov3_vitb16.pth
+head_type: cls
+
+# loss / target — 3-class CE on {-1, 0, +1}, submit P(+1) − P(−1)
+target_type: 3class
+loss_fn: ce
+
+# optimization (matches RAD-DINO 518 recipe, validated for 3-class CE on ViT-B)
+epochs: 8
+batch_size_per_gpu: 16
+num_workers: 8
+lr_head: 1.0e-3
+lr_backbone: 1.0e-6
+weight_decay: 1.0e-4
+warmup_ratio: 0.05
+grad_clip: 1.0
+mixup_alpha: 0.0   # mixup is incompatible with integer class targets
+
+# eval / ckpt
+eval_every_steps: 2000
+primary_metric: nmse
+
+# misc
+seed: 0
+log_every_steps: 20
